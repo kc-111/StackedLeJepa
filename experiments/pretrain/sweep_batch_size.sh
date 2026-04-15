@@ -18,10 +18,13 @@ cd "$SCRIPT_DIR"
 FILTER_DATASET="${1:-all}"
 FILTER_BS="${2:-all}"
 
-# Dataset-specific batch sizes and epochs
+# Dataset-specific batch sizes and epochs.
+# All values lie inside the locked-in 5-point sweep {8, 16, 32, 48, 64};
+# BS=128 was dropped because it falls past the convnextv2_nano saturation
+# point and adds wall-clock without adding new physics.
 declare -A BATCH_SIZES=(
-    [cifar100]="32 64 128"
-    [cifar10]="32 64 128"
+    [cifar100]="32 48 64"
+    [cifar10]="32 48 64"
     [flowers102]="16 32 64"
 )
 declare -A EPOCHS=(

@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from src.accumulated_w1 import (
+from src.sliced_gauss_reg import (
     SlicedW1Loss, SlicedW2Loss, SIGRegLoss,
     DeepMLP, generate_data, make_fixed_projection, GENERATORS,
     eval_w1, evaluate_full,
@@ -100,6 +100,7 @@ def train_one(seed, args, loss_mode, proj_dim, distribution, device):
                 w1_val = eval_w1(full_out)
                 eval_steps.append(step)
                 eval_w1s.append(w1_val)
+                print(f"  step={step:5d}  W1={w1_val:.4f}")
             mlp.train()
 
     mlp.eval()
@@ -192,8 +193,8 @@ def parse_args():
                     default=list(GENERATORS.keys()),
                     choices=list(GENERATORS.keys()))
     p.add_argument("--input-dim", type=int, default=4)
-    p.add_argument("--proj-dims", type=int, nargs="+", default=[8, 32])
-    p.add_argument("--num-points", type=int, default=1024)
+    p.add_argument("--proj-dims", type=int, nargs="+", default=[8])
+    p.add_argument("--num-points", type=int, default=16384)
     p.add_argument("--steps", type=int, default=10000)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden-dim", type=int, default=256)

@@ -15,9 +15,13 @@ devices, while global operations and pooled accumulation do not.
     pooled_w1            — T no-grad + 1 grad per device, local pooled W1
     pooled_global_w1     — local accumulation + all-gather grad embeddings, W1 on union
 
+Fairness: Option A (grad-compute-matched). Each opt step consumes
+D*BS_per_device grad samples; pooled no-grad context is "free". An epoch is
+K // (D*BS_per_device) opt steps. See experiments/synthetic/FAIRNESS.md.
+
 Run:
     python experiments/synthetic/exp1_3_ddp_sim.py
-    python experiments/synthetic/exp1_3_ddp_sim.py --distributions blobs --num-devices 1 4 8 --n-seeds 1 --steps 500
+    python experiments/synthetic/exp1_3_ddp_sim.py --distributions blobs --num-devices 1 4 8 --n-seeds 1 --epochs 5
 """
 
 import os
@@ -36,13 +40,12 @@ import matplotlib.pyplot as plt
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from src.accumulated_w1 import (
-    SlicedW1Loss, SIGRegLoss, AccumulatedSlicedLoss,
-    DeepMLP, generate_data, make_fixed_projection, GENERATORS,
+from src.sliced_gauss_reg import (
+    SlicedW1Loss, SIGRegLoss, SIGReg, PooledSlicedLoss,
+    DeepMLP, generate_data, make_fixed_projection, epoch_iter, GENERATORS,
     eval_w1, evaluate_full,
 )
-from src.accumulated_w1.losses import _random_unit_directions, _gaussian_quantiles
-from module import SIGReg
+from src.sliced_gauss_reg.losses import _random_unit_directions, _gaussian_quantiles
 
 
 DDP_MODES = [
@@ -99,7 +102,13 @@ def _setup(seed, args, distribution, device):
 
 
 def train_one(seed, args, ddp_mode, distribution, num_devices, device):
-    """Train one run with simulated DDP."""
+    """Train one run with simulated DDP.
+
+    Option A (grad-compute-matched): each opt step consumes total_bs =
+    D * shard_size grad samples drawn from the epoch permutation. Pooled
+    modes additionally draw (T_accum-1) no-grad batches per device per step,
+    but those are "free context" and not counted toward the epoch.
+    """
     projected, mlp, opt, src_np, colors, initial_out = \
         _setup(seed, args, distribution, device)
     D_dim = args.input_dim
@@ -107,23 +116,28 @@ def train_one(seed, args, ddp_mode, distribution, num_devices, device):
     total_bs = shard_size * num_devices
     K = args.num_points
     T_accum = args.accum_steps  # local accumulation steps per device
+    if total_bs > K:
+        raise ValueError(f"total_bs={total_bs} exceeds dataset K={K}")
 
     w1_fn = SlicedW1Loss(num_proj=args.num_proj).to(device)
     sigreg_fn = SIGRegLoss(knots=args.knots, num_proj=args.num_proj).to(device)
     sigreg_mod = SIGReg(knots=args.knots, num_proj=args.num_proj).to(device)
 
     # For pooled modes, each simulated device has its own accumulator
-    # Use separate RNG per device to ensure different batches
+    # Use separate RNG per device to ensure different no-grad batches
     device_rngs = [torch.Generator(device=device).manual_seed(seed + 300 + d)
                    for d in range(num_devices)]
+    epoch_gen = torch.Generator(device=device).manual_seed(seed + 400)
 
     eval_steps, eval_w1s = [], []
+    global_step = 0
 
-    for step in range(1, args.steps + 1):
+    for epoch in range(1, args.epochs + 1):
+      for grad_chunk in epoch_iter(K, total_bs, device, epoch_gen):
         mlp.train()
 
-        # Sample total_bs indices, split into D shards (for non-pooled modes)
-        idx = torch.randint(0, K, (total_bs,), device=projected.device)
+        # Split the epoch chunk into D per-device shards (= effective batch).
+        idx = grad_chunk
         shards = [idx[i * shard_size:(i + 1) * shard_size]
                   for i in range(num_devices)]
 
@@ -138,18 +152,20 @@ def train_one(seed, args, ddp_mode, distribution, num_devices, device):
         elif ddp_mode == "global_sigreg":
             # All-reduce ECF: equivalent to SIGReg on full batch.
             # All samples contribute gradient through the all-reduced cos/sin.
+            # Divide by D to match local_sigreg gradient scale: SIGReg's
+            # *n statistic amplifies with the all-gathered sample count.
             output = mlp(projected[idx])
-            loss = sigreg_fn(output)
+            loss = sigreg_fn(output) / num_devices
             opt.zero_grad()
             loss.backward()
             opt.step()
 
         elif ddp_mode == "pooled_sigreg":
-            # Each device pools locally with AccumulatedSlicedLoss (sigreg).
+            # Each device pools locally with PooledSlicedLoss (sigreg).
             # No communication between devices.
             opt.zero_grad()
             for d in range(num_devices):
-                accum = AccumulatedSlicedLoss(
+                accum = PooledSlicedLoss(
                     accum_steps=T_accum - 1, num_proj=args.num_proj,
                     mode="sigreg", sigreg=sigreg_mod)
                 with torch.no_grad():
@@ -196,6 +212,8 @@ def train_one(seed, args, ddp_mode, distribution, num_devices, device):
             all_grad = torch.cat(grad_embeddings, dim=0)
 
             # Phase 4: each device's view = all_grad + local_acc → SIGReg
+            # Divide by D² (D for DDP averaging, D for all-gather
+            # amplification) to match local/pooled gradient scale.
             total_loss = torch.tensor(0.0, device=device)
             for d in range(num_devices):
                 if device_accumulated[d]:
@@ -203,8 +221,7 @@ def train_one(seed, args, ddp_mode, distribution, num_devices, device):
                     device_emb = torch.cat([all_grad, local_acc], dim=0)
                 else:
                     device_emb = all_grad
-                # SIGReg handles its own scaling internally
-                device_loss = sigreg_mod(device_emb) / num_devices
+                device_loss = sigreg_mod(device_emb) / (num_devices * num_devices)
                 total_loss = total_loss + device_loss
 
             total_loss.backward()
@@ -314,13 +331,15 @@ def train_one(seed, args, ddp_mode, distribution, num_devices, device):
             total_loss.backward()
             opt.step()
 
-        if step % args.eval_interval == 0:
-            mlp.eval()
-            with torch.no_grad():
-                w1_val = eval_w1(mlp(projected).cpu().numpy())
-                eval_steps.append(step)
-                eval_w1s.append(w1_val)
-            mlp.train()
+        global_step += 1
+
+      mlp.eval()
+      with torch.no_grad():
+          w1_val = eval_w1(mlp(projected).cpu().numpy())
+          eval_steps.append(global_step)
+          eval_w1s.append(w1_val)
+          print(f"  epoch={epoch:3d}  step={global_step:6d}  W1={w1_val:.4f}")
+      mlp.train()
 
     mlp.eval()
     with torch.no_grad():
@@ -363,7 +382,7 @@ def plot_ddp_degradation(all_runs, dist, D_values, seeds, save_path):
 
     ax.set_xlabel("Simulated Devices D", fontsize=12)
     ax.set_ylabel("Final Sliced W1 to N(0,1)", fontsize=11)
-    ax.set_title(f"{dist}, BS/device={64}, M=32", fontsize=13)
+    ax.set_title(f"{dist}, BS/device={64}, M=8", fontsize=13)
     ax.set_xscale("log", base=2)
     ax.set_xticks(D_values)
     ax.set_xticklabels([str(d) for d in D_values])
@@ -386,24 +405,25 @@ def parse_args():
                     default=list(GENERATORS.keys()),
                     choices=list(GENERATORS.keys()))
     p.add_argument("--input-dim", type=int, default=4)
-    p.add_argument("--proj-dim", type=int, default=32)
-    p.add_argument("--num-points", type=int, default=1024)
-    p.add_argument("--batch-size", type=int, default=64,
+    p.add_argument("--proj-dim", type=int, default=8)
+    p.add_argument("--num-points", type=int, default=16384)
+    p.add_argument("--batch-size", type=int, default=32,
                     help="Batch size per device (total = D * batch_size)")
-    p.add_argument("--accum-steps", type=int, default=4,
+    p.add_argument("--accum-steps", type=int, default=8,
                     help="T: local accumulation steps per device (for pooled modes)")
-    p.add_argument("--num-devices", type=int, nargs="+", default=[1, 2, 4, 8, 16])
-    p.add_argument("--steps", type=int, default=10000)
+    p.add_argument("--num-devices", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64])
+    p.add_argument("--epochs", type=int, default=80,
+                    help="Grad-compute-matched epochs (Option A): each epoch is "
+                         "K // (D*BS_per_device) opt steps. See FAIRNESS.md.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--num-proj", type=int, default=1024)
     p.add_argument("--knots", type=int, default=17)
     p.add_argument("--n-seeds", type=int, default=3)
-    p.add_argument("--eval-interval", type=int, default=100)
     p.add_argument("--save-dir", default="results/exp1_3_ddp_sim")
     p.add_argument("--device", default="auto")
-    p.add_argument("--num-workers", type=int, default=4,
+    p.add_argument("--num-workers", type=int, default=1,
                     help="Total parallel workers (for sharding)")
     p.add_argument("--worker-id", type=int, default=0,
                     help="This worker's index (0..num_workers-1)")
@@ -510,7 +530,7 @@ def main():
         f"Exp 1.3: DDP Simulation",
         f"d={args.input_dim}, M={args.proj_dim}, BS_per_device={args.batch_size}, "
         f"accum_steps={args.accum_steps}, "
-        f"K={args.num_points}, steps={args.steps}, seeds={len(seeds)}",
+        f"K={args.num_points}, epochs={args.epochs} (Option A), seeds={len(seeds)}",
         "",
         f"{'Distribution':<18} {'Mode':<22} {'D':>3}  {'W1':>14}",
         "-" * 65,

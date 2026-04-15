@@ -5,6 +5,7 @@ description = "Pooled distributional regularization for JEPAs"
 requires-python = ">=3.10"
 
 dependencies = [
+    "scipy",
     "torch>=2.0",
     "torchvision>=0.15",
     "numpy",

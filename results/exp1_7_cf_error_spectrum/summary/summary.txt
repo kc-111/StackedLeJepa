@@ -1,0 +1,12 @@
+Exp 1.7: CF Error Spectrum — W1 vs SIGReg
+K=8192, steps=10000, seeds=3
+
+Crossover frequency t* ~ 2.13
+  t < t*: SIGReg has lower CF error (low-frequency structure)
+  t > t*: W1 has lower CF error (high-frequency / fine placement)
+  SIGReg weight exp(-t*^2/2) = 0.1033
+
+W1 evaluation floors:
+  Sliced W1    0.0105
+  SIGReg       0.0169
+  SIGReg + W1  0.0166

@@ -18,7 +18,7 @@ import torch
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from src.accumulated_w1 import DeepMLP, generate_data, make_fixed_projection
+from src.sliced_gauss_reg import DeepMLP, generate_data, make_fixed_projection
 
 
 def test_synthetic(device):

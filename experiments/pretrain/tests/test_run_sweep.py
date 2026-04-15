@@ -26,6 +26,7 @@ from run_sweep import (
     HEADLINE_CONT_BS,
     BASE_BS,
     BASE_SEED,
+    DEFAULT_ENCODER,
 )
 
 
@@ -37,7 +38,7 @@ SAVE_DIR = "runs/sweep"
 # ---------------------------------------------------------------------------
 
 def test_smoke_plan_at_most_two_runs():
-    specs = plan_smoke(epochs=1, encoder="resnet18", save_dir=SAVE_DIR)
+    specs = plan_smoke(epochs=1, encoder="convnextv2_nano", save_dir=SAVE_DIR)
     assert 1 <= len(specs) <= 2
     # Should exercise both code paths: at least one base, one continuation.
     assert any(s.continue_from == "" for s in specs)
@@ -45,7 +46,7 @@ def test_smoke_plan_at_most_two_runs():
 
 
 def test_phase0_base_has_three_runs_no_continuation():
-    specs = plan_phase0_base(epochs=200, encoder="resnet18", save_dir=SAVE_DIR)
+    specs = plan_phase0_base(epochs=200, encoder="convnextv2_nano", save_dir=SAVE_DIR)
     assert len(specs) == 3
     assert all(s.continue_from == "" for s in specs)
     assert {s.dataset for s in specs} == set(HEADLINE_DATASETS)
@@ -54,7 +55,7 @@ def test_phase0_base_has_three_runs_no_continuation():
 
 
 def test_phase1_fig3_has_180_continuation_runs():
-    specs = plan_phase1_fig3(epochs=50, encoder="resnet18", save_dir=SAVE_DIR)
+    specs = plan_phase1_fig3(epochs=50, encoder="convnextv2_nano", save_dir=SAVE_DIR)
     # 3 datasets × 5 bs × 4 methods × 3 seeds
     assert len(specs) == 180
     # Every run is a continuation
@@ -75,7 +76,7 @@ def test_phase1_fig3_has_180_continuation_runs():
 
 
 def test_phase2_tab1_has_65_runs():
-    specs = plan_phase2_tab1(epochs=50, encoder="resnet18", save_dir=SAVE_DIR)
+    specs = plan_phase2_tab1(epochs=50, encoder="convnextv2_nano", save_dir=SAVE_DIR)
     # 5 new bases + 5 ds × 4 methods × 3 seeds = 5 + 60 = 65
     assert len(specs) == 65
     bases = [s for s in specs if not s.continue_from]
@@ -89,17 +90,17 @@ def test_phase2_tab1_has_65_runs():
 
 
 def test_phase3_tab2_has_66_runs():
-    specs = plan_phase3_tab2(epochs=50, encoder="resnet18", save_dir=SAVE_DIR)
-    # 12 bases (4 archs × 3 ds) + 54 cont (3 non-resnet18 archs × 3 ds × 2 methods × 3 seeds)
+    specs = plan_phase3_tab2(epochs=50, encoder="convnextv2_nano", save_dir=SAVE_DIR)
+    # 12 bases (4 archs × 3 ds) + 54 cont (3 non-default archs × 3 ds × 2 methods × 3 seeds)
     assert len(specs) == 66
     bases = [s for s in specs if not s.continue_from]
     conts = [s for s in specs if s.continue_from]
     assert len(bases) == 12
     assert len(conts) == 54
-    # No resnet18 continuations (they're reused from Phase 1/2)
-    assert all(s.encoder_scale != "resnet18" for s in conts)
-    # Continuation archs cover the 3 non-resnet18 backbones
-    assert {s.encoder_scale for s in conts} == set(TAB2_ARCHS) - {"resnet18"}
+    # No DEFAULT_ENCODER continuations (those rows are reused from Phase 1/2)
+    assert all(s.encoder_scale != DEFAULT_ENCODER for s in conts)
+    # Continuation archs cover the other 3 backbones
+    assert {s.encoder_scale for s in conts} == set(TAB2_ARCHS) - {DEFAULT_ENCODER}
     # Continuation datasets cover all of TAB2_DATASETS
     assert {s.dataset for s in conts} == set(TAB2_DATASETS)
     # Continuation methods are exactly HEADLINE_METHODS
@@ -179,9 +180,9 @@ def test_base_ckpt_path_matches_trainer_build_run_dir():
 def test_phase1_continue_from_paths_are_well_formed():
     """Phase 1 builds continue_from paths from base_ckpt_path; spot-check the
     structure for cifar100."""
-    specs = plan_phase1_fig3(epochs=50, encoder="resnet18", save_dir=SAVE_DIR)
+    specs = plan_phase1_fig3(epochs=50, encoder="convnextv2_nano", save_dir=SAVE_DIR)
     cifar_specs = [s for s in specs if s.dataset == "cifar100"]
-    expected = base_ckpt_path(SAVE_DIR, "cifar100", "resnet18")
+    expected = base_ckpt_path(SAVE_DIR, "cifar100", "convnextv2_nano")
     assert all(s.continue_from == expected for s in cifar_specs)
-    assert "cifar100_resnet18_sigreg_bs8_seed42" in expected
+    assert "cifar100_convnextv2_nano_sigreg_bs8_seed42" in expected
     assert expected.endswith("/final.pt")

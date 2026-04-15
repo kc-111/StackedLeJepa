@@ -7,13 +7,21 @@ import timm
 from configs import is_vit
 
 
-class MLP(nn.Module):
-    """Projector MLP: Linear → LayerNorm → GELU → Linear."""
+class Projector(nn.Module):
+    """3-layer projector MLP: Linear → LN → GELU → Linear → LN → GELU → Linear.
+
+    Matches the authors' reference implementation (3 layers, hidden > embedding dim).
+    Uses LayerNorm (not BatchNorm) so the projector is consistent across
+    the two passes of pooled training.
+    """
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim),
@@ -46,7 +54,7 @@ class LeJEPAEncoder(nn.Module):
             # (global=224, local=96 typically). dynamic_img_size lets a single
             # ViT handle both without re-instantiating positional embeddings.
             kwargs["dynamic_img_size"] = True
-            kwargs["img_size"] = cfg.global_crop_size
+            kwargs["img_size"] = cfg.crop_size
             kwargs["patch_size"] = cfg.patch_size
 
         self.backbone = timm.create_model(cfg.backbone_name, **kwargs)
@@ -54,7 +62,8 @@ class LeJEPAEncoder(nn.Module):
                 self.backbone, "set_grad_checkpointing"):
             self.backbone.set_grad_checkpointing(True)
         self._hidden_dim = self.backbone.num_features
-        self.projector = MLP(self._hidden_dim, cfg.proj_hidden, cfg.proj_dim)
+        self.projector = Projector(self._hidden_dim, cfg.proj_hidden, cfg.proj_dim)
+
 
     @property
     def hidden_dim(self):
@@ -68,11 +77,14 @@ class LeJEPAEncoder(nn.Module):
 
 
 class LinearProbe(nn.Module):
-    """Linear classification probe on frozen backbone embeddings."""
+    """LayerNorm + Linear probe on frozen backbone embeddings (paper Sec 6.1)."""
 
     def __init__(self, input_dim: int, num_classes: int):
         super().__init__()
-        self.fc = nn.Linear(input_dim, num_classes)
+        self.probe = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, num_classes),
+        )
 
     def forward(self, x):
-        return self.fc(x)
+        return self.probe(x)

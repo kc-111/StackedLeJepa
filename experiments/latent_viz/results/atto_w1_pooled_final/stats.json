@@ -1,0 +1,34 @@
+{
+  "checkpoint": "runs/lejepa_v1/cifar100_convnextv2_atto_w1_pooled_bs32_seed42/final.pt",
+  "epoch": 399,
+  "dataset": "cifar100",
+  "backbone": "convnextv2_atto",
+  "regularizer": "w1",
+  "accumulate": true,
+  "proj_dim": 32,
+  "num_images": 16,
+  "num_aug": 128,
+  "num_eval": 4096,
+  "distribution": {
+    "w1": 0.12690462172031403,
+    "w2": 0.15998293459415436,
+    "mean_norm": 0.28591203689575195,
+    "mean_abs_max": 0.13232333958148956,
+    "cov_frob_rel": 0.3296050727367401,
+    "cov_diag_mean": 0.7521907091140747,
+    "cov_diag_std": 0.07855921983718872,
+    "cov_offdiag_max": 0.13553866744041443,
+    "proj_eff_rank": 31.69093894958496,
+    "emb_dim": 320.0,
+    "emb_eff_rank": 135.08514404296875,
+    "emb_eff_rank_ratio": 0.42214107513427734,
+    "emb_mean_norm": 8.059100151062012,
+    "emb_var_mean": 0.7662101984024048,
+    "emb_var_min": 0.13042870163917542
+  },
+  "clusters": {
+    "intra_cluster_radius_mean": 0.8339657187461853,
+    "inter_cluster_distance_mean": 8.098285675048828,
+    "intra_over_inter": 0.10298052602857295
+  }
+}

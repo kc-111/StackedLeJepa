@@ -13,9 +13,14 @@ The FIFO stores complete past windows. Each past window has T_cur * BS
 embeddings computed from an older model state. As T_fifo grows, CDF
 resolution improves but staleness increases.
 
+Fairness: Option A (grad-compute-matched). Each opt step does 1 grad batch
+of size BS; the (T_cur-1) current-window no-grad samples and the FIFO are
+"free context". An epoch is K // BS opt steps, constant across all
+(T_cur, T_fifo) cells. See experiments/synthetic/FAIRNESS.md.
+
 Run:
     python experiments/synthetic/exp1_5_fifo.py
-    python experiments/synthetic/exp1_5_fifo.py --distributions blobs --t-cur 4 --t-fifo 0 2 4 --n-seeds 1 --steps 500
+    python experiments/synthetic/exp1_5_fifo.py --distributions blobs --t-cur 4 --t-fifo 0 2 4 --n-seeds 1 --epochs 5
 """
 
 import os
@@ -34,9 +39,9 @@ import matplotlib.pyplot as plt
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from src.accumulated_w1 import (
-    SlicedW1Loss, AccumulatedSlicedLoss,
-    DeepMLP, generate_data, make_fixed_projection, GENERATORS,
+from src.sliced_gauss_reg import (
+    PooledSlicedLoss,
+    DeepMLP, generate_data, make_fixed_projection, epoch_iter, GENERATORS,
     eval_w1, evaluate_full,
 )
 
@@ -72,6 +77,12 @@ def _setup(seed, args, distribution, device):
 def train_one(seed, args, distribution, T_cur, T_fifo, device):
     """Train with pooled accumulation + FIFO buffer.
 
+    Option A (grad-compute-matched): each opt step consumes BS grad samples
+    drawn from the epoch permutation. The (T_cur-1) current-window no-grad
+    samples and the FIFO contents are "free context" — they don't count
+    toward the epoch budget. An epoch is K // BS opt steps for every
+    (T_cur, T_fifo) cell.
+
     Args:
         T_cur: Current-window steps (T_cur-1 no-grad + 1 grad).
         T_fifo: Number of past windows to retain in FIFO.
@@ -85,35 +96,38 @@ def train_one(seed, args, distribution, T_cur, T_fifo, device):
 
     fifo_size = T_fifo * T_cur * BS if T_fifo > 0 else 0
 
-    accum_loss = AccumulatedSlicedLoss(
+    accum_loss = PooledSlicedLoss(
         accum_steps=max(T_cur - 1, 0), num_proj=args.num_proj,
         mode="w1", fifo_size=fifo_size)
+    epoch_gen = torch.Generator(device=device).manual_seed(seed + 400)
 
     eval_steps, eval_w1s = [], []
+    global_step = 0
 
-    for step in range(1, args.steps + 1):
-        mlp.train()
-
-        # T_cur - 1 no-grad forward passes
-        with torch.no_grad():
-            for _ in range(T_cur - 1):
-                idx = torch.randint(0, K, (BS,), device=projected.device)
-                accum_loss.accum_step(mlp(projected[idx]))
-
-        # 1 gradient step
-        idx = torch.randint(0, K, (BS,), device=projected.device)
-        loss = accum_loss.grad_step(mlp(projected[idx]))
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
-        if step % args.eval_interval == 0:
-            mlp.eval()
-            with torch.no_grad():
-                w1_val = eval_w1(mlp(projected).cpu().numpy())
-                eval_steps.append(step)
-                eval_w1s.append(w1_val)
+    for epoch in range(1, args.epochs + 1):
+        for grad_chunk in epoch_iter(K, BS, device, epoch_gen):
             mlp.train()
+
+            # T_cur - 1 no-grad batches drawn freely (free context)
+            with torch.no_grad():
+                for _ in range(T_cur - 1):
+                    idx = torch.randint(0, K, (BS,), device=projected.device)
+                    accum_loss.accum_step(mlp(projected[idx]))
+
+            # 1 gradient batch from the epoch permutation
+            loss = accum_loss.grad_step(mlp(projected[grad_chunk]))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            global_step += 1
+
+        mlp.eval()
+        with torch.no_grad():
+            w1_val = eval_w1(mlp(projected).cpu().numpy())
+            eval_steps.append(global_step)
+            eval_w1s.append(w1_val)
+            print(f"  epoch={epoch:3d}  step={global_step:6d}  W1={w1_val:.4f}")
+        mlp.train()
 
     mlp.eval()
     with torch.no_grad():
@@ -208,20 +222,21 @@ def parse_args():
                     default=list(GENERATORS.keys()),
                     choices=list(GENERATORS.keys()))
     p.add_argument("--input-dim", type=int, default=4)
-    p.add_argument("--proj-dim", type=int, default=32)
-    p.add_argument("--num-points", type=int, default=1024)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--proj-dim", type=int, default=8)
+    p.add_argument("--num-points", type=int, default=16384)
+    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--t-cur", type=int, nargs="+", default=[1, 2, 4, 8],
                     help="Current-window accumulation steps")
     p.add_argument("--t-fifo", type=int, nargs="+", default=[0, 1, 2, 4, 8],
                     help="Number of past windows to retain (0=no FIFO)")
-    p.add_argument("--steps", type=int, default=10000)
+    p.add_argument("--epochs", type=int, default=80,
+                    help="Grad-compute-matched epochs (Option A): each epoch is "
+                         "K // BS opt steps. See FAIRNESS.md.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--num-proj", type=int, default=1024)
     p.add_argument("--n-seeds", type=int, default=3)
-    p.add_argument("--eval-interval", type=int, default=100)
     p.add_argument("--save-dir", default="results/exp1_5_fifo")
     p.add_argument("--device", default="auto")
     p.add_argument("--num-workers", type=int, default=1,
@@ -313,7 +328,7 @@ def main():
     summary_lines = [
         f"Exp 1.5: FIFO Buffer",
         f"d={args.input_dim}, M={args.proj_dim}, BS={args.batch_size}, "
-        f"steps={args.steps}, seeds={len(seeds)}",
+        f"epochs={args.epochs} (Option A), seeds={len(seeds)}",
         "",
         f"{'Distribution':<18} {'T_cur':>5} {'T_fifo':>6} {'CDF':>6}  {'W1':>14}",
         "-" * 60,

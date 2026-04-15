@@ -45,7 +45,7 @@ class RunSpec:
     accumulate: bool
     batch_size: int
     epochs: int
-    accum_steps: int = 8
+    nograd_pool_size: int = 0      # number of no-grad samples for regularizer pool
     continue_from: str = ""        # path to base ckpt; empty = from scratch
     extra_args: Tuple[str, ...] = ()
 
@@ -78,13 +78,21 @@ HEADLINE_METHODS = [
 
 HEADLINE_DATASETS = ["cifar100", "food101", "flowers102"]   # Phase 0 + Phase 1
 TAB1_NEW_DATASETS = ["cifar10", "stl10", "dtd", "aircraft", "pets"]  # Phase 2
-TAB2_ARCHS = ["resnet18", "resnet34", "convnextv2_nano", "tiny"]
+# Phase 3 architecture sweep — all LayerNorm-only. BN backbones (resnet*) have
+# shown instability with pooled training; see "Note on BatchNorm" in EXPERIMENT_PLAN.md.
+TAB2_ARCHS = ["convnextv2_atto", "convnextv2_pico", "convnext_tiny", "tiny"]
 TAB2_DATASETS = ["cifar100", "flowers102", "pets"]
 
-CONT_BS_VALUES = [8, 16, 32, 64, 128]
+# 5-point continuation BS sweep. BS=128 was dropped because the per-pool-epoch
+# cost is essentially constant past saturation, so 128 adds budget without
+# adding new physics — and fullgrad OOMs at BS=64 already.
+CONT_BS_VALUES = [8, 16, 32, 48, 64]
 CONT_SEEDS = [0, 1, 2]
 CONT_EPOCHS = 50
 HEADLINE_CONT_BS = 32          # the bs used in Tab 1 / Tab 2
+
+# Default backbone for sweep plans when --encoder isn't passed.
+DEFAULT_ENCODER = "convnextv2_pico"
 
 BASE_BS = 8
 BASE_EPOCHS = 200
@@ -114,7 +122,7 @@ def plan_smoke(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
 
     Exercises both the from-scratch and continuation code paths.
     """
-    enc = encoder or "resnet18"
+    enc = encoder or DEFAULT_ENCODER
     ep = epochs or 1
     base_path = base_ckpt_path(save_dir, "cifar100", enc)
     return [
@@ -126,7 +134,7 @@ def plan_smoke(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
 
 def plan_phase0_base(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
     """Phase 0 — base sigreg trainings on 3 headline datasets, single seed."""
-    enc = encoder or "resnet18"
+    enc = encoder or DEFAULT_ENCODER
     ep = epochs or BASE_EPOCHS
     return [
         RunSpec(
@@ -140,7 +148,7 @@ def plan_phase0_base(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
 
 def plan_phase1_fig3(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
     """Phase 1 — Fig 3: 3 datasets × 5 cont bs × 4 methods × 3 seeds = 180."""
-    enc = encoder or "resnet18"
+    enc = encoder or DEFAULT_ENCODER
     ep = epochs or CONT_EPOCHS
     specs = []
     for ds in HEADLINE_DATASETS:
@@ -163,7 +171,7 @@ def plan_phase2_tab1(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
 
     HEADLINE_DATASETS (cifar100/food101/flowers102) are reused from Phase 0.
     """
-    enc = encoder or "resnet18"
+    enc = encoder or DEFAULT_ENCODER
     ep_base = epochs or BASE_EPOCHS
     ep_cont = epochs or CONT_EPOCHS
     specs = []
@@ -192,14 +200,14 @@ def plan_phase2_tab1(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
 def plan_phase3_tab2(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
     """Phase 3 — Tab 2 architecture sweep: 12 bases + 54 cont = 66.
 
-    All 12 (arch, ds) bases are enumerated; the resnet18 ones are no-ops at
-    runtime via skip-if-final-exists (those checkpoints exist from Phase 0
-    for cifar100/flowers102 and from Phase 2 for pets).
+    All 12 (arch, ds) bases are enumerated; the DEFAULT_ENCODER ones are
+    no-ops at runtime via skip-if-final-exists (those checkpoints exist from
+    Phase 0 for cifar100/flowers102 and from Phase 2 for pets).
 
-    Continuations skip arch=resnet18 entirely: every (resnet18, ds) at
-    HEADLINE_CONT_BS with HEADLINE_METHODS is already covered by Phase 1
-    (cifar100/flowers102) or Phase 2 (pets) with 3 seeds each. That removes
-    18 cont runs (3 ds × 2 methods × 3 seeds), leaving 72 - 18 = 54.
+    Continuations skip arch=DEFAULT_ENCODER entirely: every (DEFAULT_ENCODER,
+    ds) at HEADLINE_CONT_BS with HEADLINE_METHODS is already covered by
+    Phase 1 (cifar100/flowers102) or Phase 2 (pets) with 3 seeds each. That
+    removes 18 cont runs (3 ds × 2 methods × 3 seeds), leaving 72 - 18 = 54.
     """
     ep_base = epochs or BASE_EPOCHS
     ep_cont = epochs or CONT_EPOCHS
@@ -212,8 +220,9 @@ def plan_phase3_tab2(epochs: int, encoder: str, save_dir: str) -> List[RunSpec]:
                 regularizer="sigreg", accumulate=False,
                 batch_size=BASE_BS, epochs=ep_base,
             ))
-            # Continuations: skip resnet18 — already covered by Phase 1/2
-            if arch == "resnet18":
+            # Continuations: skip the default encoder — already covered
+            # by Phase 1/2
+            if arch == DEFAULT_ENCODER:
                 continue
             base_path = base_ckpt_path(save_dir, ds, arch)
             for reg, acc in HEADLINE_METHODS:
@@ -249,7 +258,7 @@ def build_command(spec: RunSpec, common: List[str]) -> List[str]:
         "--regularizer", spec.regularizer,
         "--batch-size", str(spec.batch_size),
         "--epochs", str(spec.epochs),
-        "--accum-steps", str(spec.accum_steps),
+        "--nograd-pool-size", str(spec.nograd_pool_size),
     ]
     if spec.accumulate:
         cmd.append("--accumulate")
@@ -298,7 +307,7 @@ def main():
         method = f"{spec.regularizer}{'_pooled' if spec.accumulate else ''}"
         cont_tag = " cont" if spec.continue_from else ""
         tag = (f"[{i}/{len(specs)}] {spec.dataset:11s} {spec.encoder_scale:16s} "
-               f"{method:14s} bs={spec.batch_size:3d} T={spec.accum_steps:2d} "
+               f"{method:14s} bs={spec.batch_size:3d} pool={spec.nograd_pool_size:3d} "
                f"ep={spec.epochs:4d}{cont_tag}")
         print(tag)
         if args.dry_run:

@@ -4,7 +4,7 @@ Cluster-friendly: all config via CLI, deterministic output dirs,
 resume support, skip-if-final-exists.
 
 Run:
-    python trainer.py --dataset cifar100 --encoder-scale resnet18
+    python trainer.py --dataset cifar100 --encoder-scale convnextv2_nano
     python trainer.py --dataset cifar100 --encoder-scale tiny --patch-size 8
     python trainer.py --dataset cifar100 --regularizer w1 --accumulate
 """
@@ -37,7 +37,8 @@ from checkpoint import save_checkpoint, load_checkpoint
 from train_loops import (
     train_epoch_standard_inmem, train_epoch_standard_loader,
     train_epoch_pooled_inmem, train_epoch_pooled_loader,
-    make_nograd_loader, evaluate,
+    make_nograd_loader, evaluate, eval_distribution,
+    FIFOBuffer,
 )
 
 
@@ -52,6 +53,8 @@ def build_run_dir(cfg):
     method = cfg.regularizer
     if cfg.accumulate:
         method += "_pooled"
+    if cfg.fifo_size > 0:
+        method += f"_fifo{cfg.fifo_size}"
     base = (f"{cfg.dataset}_{cfg.encoder_scale}_{method}"
             f"_bs{cfg.batch_size}_seed{cfg.seed}")
     if cfg.continue_from:
@@ -89,8 +92,8 @@ def main():
 
     print(f"Dataset: {cfg.dataset} ({cfg.num_classes} classes)")
     print(f"Backbone: {cfg.backbone_name}")
-    print(f"Multi-crop: V_g={cfg.num_global_views}@{cfg.global_crop_size} "
-          f"+ V_l={cfg.num_local_views}@{cfg.local_crop_size}")
+    print(f"Aug: {cfg.num_aug_views} view(s) @ {cfg.crop_size}² "
+          f"+ 1 unaugmented original")
     print(f"Regularizer: {cfg.regularizer}, accumulate={cfg.accumulate}")
     print(f"Projector: {cfg.proj_hidden}→{cfg.proj_dim}")
     print(f"Training: bs={cfg.batch_size}, epochs={cfg.epochs}, "
@@ -107,14 +110,14 @@ def main():
         steps_per_epoch = len(train_source) // cfg.batch_size
     else:
         steps_per_epoch = len(train_source)
-    total_steps = cfg.epochs * steps_per_epoch
     warmup_steps = cfg.warmup_epochs * steps_per_epoch
-    print(f"Steps/epoch: {steps_per_epoch}, total: {total_steps}, "
+    print(f"Steps/epoch: {steps_per_epoch}, "
           f"in_memory={in_memory}")
 
     # Model
     encoder = LeJEPAEncoder(cfg).to(device)
-    probe = LinearProbe(encoder.hidden_dim, cfg.num_classes).to(device)
+    probe_dim = encoder.hidden_dim if cfg.probe_on_emb else cfg.proj_dim
+    probe = LinearProbe(probe_dim, cfg.num_classes).to(device)
     if cfg.use_compile:
         encoder = torch.compile(encoder)
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")
@@ -124,10 +127,8 @@ def main():
         encoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     probe_opt = torch.optim.AdamW(
         probe.parameters(), lr=cfg.probe_lr, weight_decay=cfg.probe_wd)
-    enc_sched = make_scheduler(enc_opt, warmup_steps, total_steps,
-                               cfg.lr, cfg.eta_min)
-    probe_sched = make_scheduler(probe_opt, warmup_steps, total_steps,
-                                 cfg.probe_lr, 1e-5)
+    enc_sched = make_scheduler(enc_opt, warmup_steps, cfg.lr)
+    probe_sched = make_scheduler(probe_opt, warmup_steps, cfg.probe_lr)
 
     # Regularizer
     reg_fn = None
@@ -135,8 +136,10 @@ def main():
     if not cfg.accumulate:
         reg_fn = build_regularizer(cfg, device)
     else:
-        if cfg.regularizer == "sigreg":
-            sigreg_mod = build_sigreg(cfg, device)
+        # Always build sigreg_mod in pooled mode — harmless when unused,
+        # and avoids breakage when cfg.regularizer is later flipped to a
+        # combined mode containing "sigreg".
+        sigreg_mod = build_sigreg(cfg, device)
 
     # Resume / continuation
     start_epoch = 0
@@ -166,16 +169,18 @@ def main():
             print(f"Resumed from {resume_path} (epoch {start_epoch}, "
                   f"step {global_step}, best_acc {best_val_acc:.4f})")
 
-    # Pooled mode: 2-step procedure. Each step samples (T-1)*BS extra
+    # Pooled mode: 2-step procedure. Each step samples nograd_pool_size extra
     # images and runs them through the encoder with no_grad to get FRESH
     # detached projections (current weights), then pools with the BS grad
     # samples for the regularizer. Cost per step ≈ 2× standard.
+    # Optional FIFO (fifo_size > 0): retains past window projections for
+    # extra CDF resolution at the cost of staleness.
     nograd_loader = None
     nograd_iter_state = [None]
-    if cfg.accumulate and not in_memory:
-        nograd_bs = (cfg.accum_steps - 1) * cfg.batch_size
+    fifo = FIFOBuffer(cfg.fifo_size) if cfg.fifo_size > 0 else None
+    if cfg.accumulate and not in_memory and cfg.nograd_pool_size > 0:
         nograd_loader = make_nograd_loader(
-            train_source.dataset, nograd_bs, cfg.num_workers)
+            train_source.dataset, cfg.nograd_pool_size, cfg.num_workers)
         nograd_iter_state = [iter(nograd_loader)]
 
     # GPU generator for in-memory sampling
@@ -190,13 +195,14 @@ def main():
             avg_loss, global_step = train_epoch_pooled_inmem(
                 epoch, encoder, probe, train_source,
                 gpu_aug, enc_opt, probe_opt, enc_sched, probe_sched, cfg,
-                global_step, sample_gen, sigreg_mod)
+                global_step, sample_gen, sigreg_mod,
+                fifo=fifo)
         elif cfg.accumulate:
             avg_loss, global_step = train_epoch_pooled_loader(
                 epoch, encoder, probe, train_source,
                 gpu_aug, nograd_loader, nograd_iter_state,
                 enc_opt, probe_opt, enc_sched, probe_sched, cfg,
-                global_step, sigreg_mod)
+                global_step, sigreg_mod, fifo=fifo)
         elif in_memory:
             avg_loss, global_step = train_epoch_standard_inmem(
                 epoch, encoder, probe, reg_fn, train_source,
@@ -215,7 +221,14 @@ def main():
         # Eval
         if (epoch + 1) % cfg.eval_interval == 0:
             val_acc = evaluate(encoder, probe, val_source, cfg)
-            print(f"  val_acc: {val_acc:.4f} (best: {best_val_acc:.4f})",
+            dist = eval_distribution(encoder, val_source, cfg)
+            tag = "emb" if cfg.probe_on_emb else "proj"
+            print(f"  val_acc({tag}): {val_acc:.4f} (best: {best_val_acc:.4f}) | "
+                  f"proj~N(0,I): w1={dist['w1']:.4f} w2={dist['w2']:.4f} "
+                  f"|μ|={dist['mean_norm']:.4f} "
+                  f"covΔI={dist['cov_frob_rel']:.4f} "
+                  f"| rank: proj={dist['proj_eff_rank']:.2f}/{cfg.proj_dim} "
+                  f"emb={dist['emb_eff_rank']:.2f}/{dist['emb_dim']}",
                   flush=True)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc

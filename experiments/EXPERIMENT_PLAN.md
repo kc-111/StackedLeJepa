@@ -26,11 +26,11 @@ The story is told as:
 
 | Setting | Value | Rationale |
 |---|---|---|
-| Backbone (default) | `resnet18` | Paper Table 5; 11M params; fastest measured |
+| Backbone (default) | `convnextv2_pico` | LayerNorm-only CNN; 8.6M params, 512-d features (same as resnet18), ~2x faster than nano. See "Note on BatchNorm" below for why we default to LN. |
 | Base batch size | **8** | Smallest practical bs — bias floor pinned hardest here |
 | Base epochs | 200 | Enough for convergence at bs=8 |
 | Continuation epochs | **50** | Enough to see clear divergence between methods |
-| Continuation bs values | **{8, 16, 32, 64, 128}** | 5-point sweep for Fig 3 |
+| Continuation bs values | **{8, 16, 32, 48, 64}** | 5-point sweep for Fig 3. BS=128 dropped — past convnextv2_nano's saturation knee (~48), adds wall-clock without adding physics. BS=48 added to anchor the saturation knee. |
 | Optimizer | AdamW lr=1e-3, wd=5e-2 | Paper default |
 | λ (reg weight) | 0.05 | Paper default |
 | `accum_steps` (T) | 8 | Pool size = 8 × bs |
@@ -39,49 +39,112 @@ The story is told as:
 | Memory format | `channels_last` | ~1.3× speedup |
 | `torch.compile` | mode=`default` | ~1.4× speedup |
 
+### Note on BatchNorm — why we default to LN-only backbones
+
+The pooled 2-pass mechanism has shown instability with BatchNorm in our
+experiments so far. We have not yet found a fix that fully resolves it, so
+we default to LN-only architectures (ConvNeXtV2, ViTs) for now. BN-based
+backbones (resnet18/34/50) may still work and are worth attempting, but
+results should be checked for the variance-drift failure mode described below.
+
+**The failure mode** (diagnosed in `idea_experimental/bn_diagnose.py`): the `inject_bn_stats` trick that makes Pass 1 and Pass 2 use the same normalization injects *constants* (Pass-1 batch stats captured under `no_grad`) into Pass 2's BN. That removes BN-train-mode's implicit gradient through batch statistics — the gradient that normally penalizes the encoder for changing the overall scale of its features. With that constraint gone, the encoder's pre-BN feature variance drifts upward monotonically:
+
+```
+epoch:    init   0    4    8    13
+rvar_max: 117  120  357 1000 1340     (~12× growth, resnet18 / cifar10 / bs64 / accum=8)
+```
+
+Eventually the run hits a numerical instability and collapses (loss jumps from ~1.7 → ~3.5 around epoch 10–12 in the 20-epoch sweep). The wild val_acc oscillation that motivated this whole investigation was the early symptom of that drift, not an EMA staleness issue.
+
+**Eval-side patches don't fix it.** We tried recalibrating BN before eval, evaluating with batch stats, freezing BN, and bumping BN momentum (all in `idea_experimental/continuation_fix.py`). They eliminate the *visible* dip in val_acc but plateau ~2 points below the standard baseline because the encoder is still drifting under the hood, and the underlying training trajectory still collapses around the same epoch.
+
+**The fix is to drop BN entirely.** LayerNorm normalizes per-sample with no running stats and no train/eval distinction, so the 2-pass mechanism is train/eval consistent automatically. The existing `_BNStatCapture` and `inject_bn_stats` machinery in `experiments/pretrain/train_loops.py` becomes a harmless no-op on LN models (the loops only register on BN modules), so **no code changes to the training loop are required** — only the backbone choice.
+
+We verified this empirically (`idea_experimental/layernorm_experiment.py`): convnextv2_nano continuation, 20 epochs, BS=64, accum=8 → pooled finishes at **0.544 val_acc vs standard 0.501 (+4.3 points)**, no dip, no collapse, encoder feature std stays in [0.79, 0.92] throughout. This is the "pooled wins" result the synthetic experiments predict — it shows up as soon as BN isn't masking it.
+
+**GroupNorm** would also avoid the pathology (it normalizes per-sample-per-group, no running stats) and is a valid fallback for any backbone that lacks an LN variant. We default to LayerNorm because the ConvNeXtV2 family provides a clean 5-rung scale ladder of LN-only CNNs (atto 3.4M → femto 4.8M → pico 8.6M → nano 15M, plus convnext_tiny at 27.8M), exactly covering the "small fast CNN" niche resnet18 used to occupy. If a future architecture comparison needs a backbone outside the ConvNeXt family, the recommended path is to either pick a LN-native variant or wrap it in `nn.GroupNorm` substitution before training.
+
+---
+
 ### NOTE: GPU saturation curve — why pooled is "almost free" at small batch sizes
 
 This is the **key cost insight** for the paper. See `experiments/compute_cost/`
 for the benchmark scripts, raw data tables, and plots.
 
-**Empirical saturation curve** (RTX 4090, ResNet18 forward at 128² resolution,
-bf16, eval mode):
+**Empirical saturation curve** — `convnextv2_nano` forward at 128², bf16, eval mode (RTX 4090):
 
 | n_imgs | time | ms/img | regime |
 |---:|---:|---:|---|
-| 1 | 1.51 ms | 1.51 | flat (under-utilized) |
-| 8 | 1.49 ms | 0.19 | flat |
-| 32 | 1.40 ms | 0.044 | flat |
-| **64** | **1.67 ms** | **0.026** | **knee** |
-| **128** | **3.08 ms** | **0.024** | **saturation point** |
-| 256 | 7.00 ms | 0.027 | linear (compute-bound) |
-| 512 | 13.19 ms | 0.026 | linear |
-| 1024 | 27.96 ms | 0.027 | linear |
-| 2048 | 55.23 ms | 0.027 | linear |
+| 1 | 3.49 ms | 3.49 | flat (under-utilized) |
+| 8 | 3.43 ms | 0.428 | flat |
+| 32 | 3.57 ms | 0.112 | flat |
+| **48** | **4.92 ms** | **0.103** | **knee** |
+| 64 | 5.99 ms | 0.094 | near-peak |
+| 96 | 9.02 ms | 0.094 | near-peak |
+| **128** | **13.53 ms** | **0.106** | **linear (compute-bound)** |
+| 256 | 31.75 ms | 0.124 | linear |
+| 512 | 62.46 ms | 0.122 | linear |
+| 1024 | 124.32 ms | 0.121 | linear |
 
-**Two regimes**:
-- **n ≤ 64**: time is essentially constant. The GPU is under-utilized; adding more
-  samples is free. ResNet18 at 128² doesn't have enough work per image to keep
-  16,384 CUDA cores busy.
+**Two regimes** (note: knee is ~3× earlier than the historical resnet18 curve):
+- **n ≤ 48**: time is essentially constant. The GPU is under-utilized; adding more
+  samples is free. convnextv2_nano at 128² has more work per image than resnet18
+  did, so the GPU saturates at ~half the batch size.
 - **n ≥ 128**: time scales linearly with n. The GPU is compute-bound; each extra
-  sample adds proportional cost.
+  sample adds proportional cost. This is exactly why we cap the BS sweep at 64.
 
-### Why pooled training is almost free at small BS
+Raw CSV: `experiments/compute_cost/results/saturation_NVIDIA_GeForce_RTX_4090_convnextv2_nano_128.csv`.
 
-Per-step cost (timing INCLUDES sample_batch + gpu_aug). RTX 4090, bf16,
-T=8, resolution 128². See `experiments/compute_cost/results/` for the raw
-markdown tables and `experiments/compute_cost/plots/` for the figures.
+### Per-step cost: pool_nograd vs std vs full-gradient oracle
 
-**ResNet18 (V_g=2, no locals)**:
+Per-step timing INCLUDES sample_batch + gpu_aug. RTX 4090, 128², T=8, V_g=2,
+no local crops. `fullgrad` is a forward+backward on T·BS samples — the
+"oracle" cost of getting the same regularizer information as `pool_nograd` if
+you also wanted gradients on every sample. Raw CSV at
+`experiments/compute_cost/results/pooled_overhead_NVIDIA_GeForce_RTX_4090_convnextv2_nano_128_T8.csv`.
 
-| BS | std | pool_nograd | pool / std | std GB | pool GB |
-|---:|---:|---:|---:|---:|---:|
-| **8** | 5.5 ms | **8.2 ms** | **1.50×** | 0.91 | 0.96 |
-| 16 | 7.3 ms | 14.1 ms | 1.93× | 0.97 | 1.17 |
-| 32 | 8.2 ms | 27.8 ms | 3.41× | 1.10 | 1.43 |
-| 64 | 12.9 ms | 47.4 ms | 3.67× | 1.36 | 2.06 |
+**convnextv2_nano (V_g=2, no locals)**:
 
-**ViT-tiny (V_g=2 + V_l=6 multi-crop)**:
+| BS | std | pool_nograd | fullgrad (T·BS) | pool/std | fullgrad/std | **pool/fullgrad** | std GB | pool GB | fullgrad GB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **8** | 13.8 ms | **24.3 ms** | 61.0 ms (64) | **1.76×** | 4.43× | **0.40×** | 1.27 | 1.36 | 3.85 |
+| 16 | 17.4 ms | 42.3 ms | 123.4 ms (128) | 2.44× | 7.11× | **0.34×** | 1.63 | 1.86 | 6.82 |
+| 32 | 25.8 ms | 90.3 ms | 253.2 ms (256) | 3.50× | 9.81× | **0.36×** | 2.37 | 2.86 | 12.68 |
+| **48** | 44.9 ms | 137.7 ms | 379.6 ms (384) | 3.07× | 8.46× | **0.36×** | 3.11 | 3.87 | 18.52 |
+| **64** | 61.0 ms | **185.3 ms** | **OOM** (512) | 3.04× | — | — | 3.85 | 4.87 | **>24** |
+
+**The headline finding**: pooled training adds only **1.76× wall clock** at BS=8
+where the bias floor matters most, and stabilizes around 3× std past saturation.
+Crucially, the `fullgrad` baseline that you'd otherwise need to get the same
+regularizer-sample count **OOMs at BS=64 on a 24 GB GPU**, while pool fits
+comfortably with under 5 GB. This gives the headline cost story:
+
+> **Pool delivers the regularizer information of an equivalent full-gradient
+> step at ~0.36× its wall clock and ~3–4× less peak memory; at the upper end
+> of our BS sweep the full-gradient baseline does not even fit, while pool
+> runs on every cell.**
+
+This matches theory: pool_nograd ≈ T·BS forwards + BS forward+backward, while
+fullgrad ≈ T·BS forward+backward. Theory predicts pool/fullgrad ≈
+`(T+2)/(3T)` = 0.42 at T=8, ignoring saturation effects. We measure 0.34–0.40
+across the sweep, *better* than the prediction at larger BS because std-on-BS
+gets the GPU under-utilization discount and fullgrad-on-T·BS doesn't.
+
+**Saturation also bounds the BS sweep itself**: per-pool-epoch wall clock on
+cifar100 is essentially constant at ~135 s across BS={8..64} because pool's
+cost is dominated by the (T-1)·BS no-grad pass, which is the same total samples
+regardless of how you split it across optimizer steps. We don't measure BS=128
+because:
+1. fullgrad doesn't fit there at all on 24 GB,
+2. pool/std and per-epoch cost both plateau, and
+3. it would add ~30% Phase 1 wall clock without adding new accuracy or cost
+   information.
+
+**ViT-tiny (V_g=2 + V_l=6 multi-crop)** — historical resnet18-era measurements
+kept here because the qualitative shape of the ViT curve hasn't changed; ViT
+backbones were always LayerNorm-based. Re-measurement on the new nano default
+of `pooled_overhead.py --backbone tiny --multicrop --resolution 128` is cheap
+and pending:
 
 | BS | std | pool_nograd | pool / std | std GB | pool GB |
 |---:|---:|---:|---:|---:|---:|
@@ -89,17 +152,14 @@ markdown tables and `experiments/compute_cost/plots/` for the figures.
 | **16** | 17.2 ms | **23.5 ms** | **1.37×** | 1.08 | 1.16 |
 | 32 | 17.4 ms | 30.5 ms | 1.75× | 1.42 | 1.58 |
 
-**The headline finding**: at small BS, pooled training adds only **1.3-1.5×
-wall clock** vs standard. At BS=8 ResNet18 it's exactly 1.50×. ViT-tiny multi-crop
-stays at ~1.4× through BS=16 because each BS sample expands to 8 view-images,
-keeping the GPU in its under-utilized regime longer.
+ViT-tiny multi-crop stays cheap longer than nano because each BS sample expands
+to 8 view-images (V_g=2 + V_l=6), keeping the GPU in its under-utilized regime
+through BS=16 even at 128² resolution.
 
 This is **exactly the regime where the bias floor matters most**: small batches
 have high finite-sample bias for distributional regularizers, and that's where
-pooling helps most. Pooling is cheapest precisely where it's most useful.
-
-ViT also demands more memory per BS step but the compute time stays roughly
-flat through BS=16 (all in the under-utilized regime).
+pooling helps most. Pooling is cheapest precisely where it's most useful, and
+the equivalent fullgrad baseline is most infeasible.
 
 ### Implications for the paper
 
@@ -154,11 +214,11 @@ sized per-call, so smaller chunks → smaller peak memory.
    utilization. There's nothing to save by being clever.
 2. **Chunking is only competitive at one BS value** (ResNet18, BS=64). Everywhere
    else it's slower or much slower.
-3. **BN consistency adds complexity.** Our production code uses a "capture and
-   inject" mechanism so both Pass 1 and Pass 2 use identical BN normalization
-   stats. Splitting Pass 1 into chunks would require either parallel-variance
-   aggregation across chunks (extra implementation) or eval-mode chunking
-   (which forfeits the BN running-stat update from the larger pool).
+
+(Earlier drafts also cited BN-consistency complexity as a reason — that point
+is now moot. With LN-only backbones, splitting Pass 1 into chunks has no
+normalization-consistency cost; the only remaining objections are kernel-launch
+overhead and the lack of need for memory savings.)
 
 **What this tells us:** the production approach (one big no-grad forward) is the
 right default. Chunking is a knob you'd want only if memory becomes the
@@ -199,7 +259,7 @@ These three datasets span **three orders of magnitude in dataset size**:
 - `food101`: 75,750 train (large)
 
 - **3 base runs**, single seed
-- Output: `runs/base/{dataset}_resnet18_sigreg_bs8_seed42/final.pt`
+- Output: `runs/base/{dataset}_convnextv2_nano_sigreg_bs8_seed42/final.pt`
 
 ### Phase 1 — Headline batch-size continuation sweep (Fig 3)
 
@@ -221,12 +281,18 @@ continuation at the **headline cont bs** (default 32).
 
 ### Phase 3 — Architecture sweep (Tab 2)
 
-For each of `resnet18`, `resnet34`, `convnextv2_nano`, `vit_tiny`, train base
-on `cifar100` / `flowers102` / `pets`, then continue with 2 methods
+For each of `convnextv2_atto`, `convnextv2_nano`, `convnext_tiny`, `vit_tiny`,
+train base on `cifar100` / `flowers102` / `pets`, then continue with 2 methods
 (`sigreg` baseline + `w1_pooled` headline) at the headline cont bs.
 
+This is a 4-rung scale ladder from 3.4M params (atto) → 27.8M (convnext_tiny),
+plus a ViT for architecture-class breadth. **All four backbones are LayerNorm-only**
+(see "Note on BatchNorm" in the default training config section); no BN
+architectures are included in the sweep, by design.
+
 - 4 archs × 3 ds × (1 base + 2 methods × 3 seeds) = 12 base + 72 cont
-- − 18 reused (resnet18 rows already done in Phase 1) = **66 runs**
+- − 18 reused (`convnextv2_nano` rows already done in Phase 1 since it is the
+  default backbone) = **66 runs**
 
 ---
 
@@ -305,7 +371,8 @@ Each plan resumes automatically — `trainer.py` skips runs whose `final.pt` alr
 
 ```bash
 python experiments/pretrain/trainer.py \
-    --continuation runs/base/cifar100_resnet18_sigreg_bs8_seed42/final.pt \
+    --continuation runs/base/cifar100_convnextv2_nano_sigreg_bs8_seed42/final.pt \
+    --encoder-scale convnextv2_nano \
     --regularizer w1 --accumulate \
     --batch-size 32 --epochs 50 --seed 0 \
     --save-dir runs/lejepa_v1

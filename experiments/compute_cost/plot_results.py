@@ -1,6 +1,6 @@
 """Generate plots from compute_cost benchmark results.
 
-Reads the markdown tables saved by saturation_curve.py and pooled_overhead.py
+Reads the CSV files saved by saturation_curve.py and pooled_overhead.py
 and produces matplotlib figures.
 
 Outputs:
@@ -15,7 +15,7 @@ Run:
 """
 
 import argparse
-import re
+import csv
 from pathlib import Path
 
 import matplotlib
@@ -47,83 +47,46 @@ METHOD_COLORS = {
 # Parsers
 # ---------------------------------------------------------------------------
 
-def parse_saturation_md(path: Path):
+def parse_saturation_csv(path: Path):
     rows = []
-    in_table = False
-    for line in path.read_text().splitlines():
-        if line.startswith("| n_imgs"):
-            in_table = True
-            continue
-        if line.startswith("|---"):
-            continue
-        if in_table:
-            if not line.startswith("|"):
-                break
-            cells = [c.strip() for c in line.split("|")[1:-1]]
-            if len(cells) < 4:
-                continue
-            n = int(cells[0])
-            ms = float(cells[1].split()[0])
-            ms_per_img = float(cells[2].split()[0])
-            thru = float(cells[3].split("/")[0])
-            rows.append((n, ms, ms_per_img, thru))
+    with path.open() as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append((
+                int(r["n_imgs"]),
+                float(r["ms"]),
+                float(r["ms_per_img"]),
+                float(r["throughput"]),
+            ))
     return rows
 
 
-def parse_pooled_md(path: Path):
-    """Parse the timing + memory tables from a pooled_overhead markdown file.
+def parse_pooled_csv(path: Path):
+    """Parse the timing + memory CSV from a pooled_overhead file.
 
     Returns (rows, mem_rows) where:
-      rows: list of dicts mapping column header → (mean_ms, std_ms) tuple
-      mem_rows: dict mapping bs → {column header: GB}
+      rows: list of dicts with key 'bs' plus method keys 'std',
+            'pool_nograd', 'pool_chunked' mapping to (mean_ms, std_ms).
+      mem_rows: dict bs → {method: peak_gb}
     """
-    text = path.read_text()
     rows = []
-    match = re.search(r"## Results — timing.*?\n(\|.*?\n(?:\|.*?\n)+)", text, re.DOTALL)
-    if not match:
-        return [], {}
-    table = match.group(1)
-    lines = table.strip().splitlines()
-    if len(lines) < 3:
-        return [], {}
-    header = [c.strip() for c in lines[0].split("|")[1:-1]]
-    for line in lines[2:]:
-        cells = [c.strip() for c in line.split("|")[1:-1]]
-        if len(cells) != len(header):
-            continue
-        row = {}
-        for h, c in zip(header, cells):
-            if h == "BS":
-                row["bs"] = int(c)
-            elif "OOM" in c:
-                row[h] = (float("nan"), float("nan"))
-            else:
-                m = re.match(r"([\d.]+)\s*±\s*([\d.]+)", c)
-                if m:
-                    row[h] = (float(m.group(1)), float(m.group(2)))
-        rows.append(row)
-
-    memory_rows = {}
-    match = re.search(r"## Results — peak GPU memory.*?\n(\|.*?\n(?:\|.*?\n)+)", text, re.DOTALL)
-    if match:
-        table = match.group(1)
-        lines = table.strip().splitlines()
-        header = [c.strip() for c in lines[0].split("|")[1:-1]]
-        for line in lines[2:]:
-            cells = [c.strip() for c in line.split("|")[1:-1]]
-            if len(cells) != len(header):
-                continue
-            bs = int(cells[0])
-            memory_rows[bs] = {}
-            for h, c in zip(header[1:], cells[1:]):
-                if "OOM" in c:
-                    memory_rows[bs][h] = float("nan")
-                    continue
-                try:
-                    memory_rows[bs][h] = float(c.split()[0])
-                except (ValueError, IndexError):
-                    pass
-    return rows, memory_rows
+    mem_rows = {}
+    with path.open() as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            bs = int(r["bs"])
+            row = {"bs": bs}
+            for method in ("std", "pool_nograd", "pool_chunked"):
+                row[method] = (
+                    float(r[f"{method}_mean_ms"]),
+                    float(r[f"{method}_std_ms"]),
+                )
+            rows.append(row)
+            mem_rows[bs] = {
+                method: float(r[f"{method}_peak_gb"])
+                for method in ("std", "pool_nograd", "pool_chunked")
+            }
+    return rows, mem_rows
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +103,7 @@ def plot_saturation(saturation_files, out_path: Path):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     colors = plt.cm.tab10.colors
     for i, sat_file in enumerate(saturation_files):
-        rows = parse_saturation_md(sat_file)
+        rows = parse_saturation_csv(sat_file)
         if not rows:
             continue
         ns = [r[0] for r in rows]
@@ -174,7 +137,7 @@ def plot_pooled_main(pooled_files, out_path: Path):
 
     for ax_idx, pooled_file in enumerate(pooled_files):
         ax = axes[0, ax_idx]
-        rows, _ = parse_pooled_md(pooled_file)
+        rows, _ = parse_pooled_csv(pooled_file)
         if not rows:
             continue
         bs_values = [r["bs"] for r in rows]
@@ -211,7 +174,7 @@ def plot_pooled_main_memory(pooled_files, out_path: Path):
 
     for ax_idx, pooled_file in enumerate(pooled_files):
         ax = axes[0, ax_idx]
-        _, mem_rows = parse_pooled_md(pooled_file)
+        _, mem_rows = parse_pooled_csv(pooled_file)
         if not mem_rows:
             continue
         bs_values = sorted(mem_rows.keys())
@@ -248,7 +211,7 @@ def plot_pooled_supplementary(pooled_files, out_path: Path):
     for ax_idx, pooled_file in enumerate(pooled_files):
         ax_top = axes[0, ax_idx]
         ax_bot = axes[1, ax_idx]
-        rows, mem_rows = parse_pooled_md(pooled_file)
+        rows, mem_rows = parse_pooled_csv(pooled_file)
         if not rows:
             continue
         bs_values = [r["bs"] for r in rows]
@@ -299,7 +262,7 @@ def plot_pooled_ratio(pooled_files, out_path: Path):
     markers = ["o", "s", "^", "D"]
 
     for f_idx, pooled_file in enumerate(pooled_files):
-        rows, _ = parse_pooled_md(pooled_file)
+        rows, _ = parse_pooled_csv(pooled_file)
         if not rows:
             continue
         bs_values = [r["bs"] for r in rows]
@@ -339,8 +302,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    saturation_files = sorted(results_dir.glob("saturation_*.md"))
-    pooled_files = sorted(results_dir.glob("pooled_overhead_*.md"))
+    saturation_files = sorted(results_dir.glob("saturation_*.csv"))
+    pooled_files = sorted(results_dir.glob("pooled_overhead_*.csv"))
 
     if saturation_files:
         plot_saturation(saturation_files, out_dir / "saturation_curve.png")

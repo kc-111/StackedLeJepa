@@ -31,9 +31,8 @@ def small_cfg():
         regularizer="w1",
         accumulate=False,
         batch_size=16,
-        accum_steps=4,
-        num_global_views=2,
-        num_local_views=0,
+        nograd_pool_size=0,
+        num_aug_views=1,
         epochs=1,
     )
     return cfg
@@ -49,9 +48,28 @@ def pooled_cfg():
         regularizer="w1",
         accumulate=True,
         batch_size=16,
-        accum_steps=4,
-        num_global_views=2,
-        num_local_views=0,
+        nograd_pool_size=48,  # equivalent to old accum_steps=4: (4-1)*16=48
+        num_aug_views=1,
+        epochs=1,
+    )
+    return cfg
+
+
+@pytest.fixture(scope="session")
+def fifo_cfg():
+    """Config for FIFO mode (single_view_reg=True)."""
+    from configs import Config
+    cfg = Config(
+        dataset="cifar100",
+        data_dir=str(REPO_ROOT / "data"),
+        encoder_scale="resnet18",
+        regularizer="w1",
+        accumulate=True,
+        batch_size=16,
+        nograd_pool_size=32,
+        fifo_size=64,
+        single_view_reg=True,
+        num_aug_views=2,
         epochs=1,
     )
     return cfg

@@ -19,7 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-KNOWN_DISTS = ["blobs", "diagonal_cross", "uniform_square", "ring", "spiral"]
+KNOWN_DISTS = ["blobs", "diagonal_cross", "ring"]
 
 # Global plot style
 plt.rcParams.update({
@@ -90,7 +90,7 @@ def parse_exp1_2(data):
             continue
         method = rem[:m_pos]
         M, T = int(rem[m_pos + 2:t_pos]), int(rem[t_pos + 2:])
-        for suf in ["_standard", "_pooled"]:
+        for suf in ["_standard", "_pooled", "_bigbatch"]:
             if method.endswith(suf):
                 r[(method[:-len(suf)], suf[1:], M, T)].append(val["w1"]["mean"])
                 break
@@ -124,6 +124,57 @@ def parse_exp1_5(data):
     return r
 
 
+def parse_exp1_8(data):
+    """Final-epoch ('floor') values from exp1_8 aggregated.json.
+
+    Input keys are ``"<dist>|<method>|D<n>"`` with per-epoch
+    ``<metric>_median`` / ``_p25`` / ``_p75`` lists. We take the final-epoch
+    median per (dist, method, D) and collect across distributions, so the
+    aggregator can produce one IQR-across-distributions number per (method, D).
+    """
+    r = defaultdict(lambda: defaultdict(list))
+    for key, val in data.items():
+        parts = key.split("|")
+        if len(parts) != 3 or not parts[2].startswith("D"):
+            continue
+        _, method, dstr = parts
+        try:
+            D = int(dstr[1:])
+        except ValueError:
+            continue
+        for metric in ("w1", "mean_mse", "cov_frob", "cov_offdiag_max"):
+            mkey = metric + "_median"
+            if mkey in val and val[mkey]:
+                r[(method, D)][metric].append(float(val[mkey][-1]))
+    return r
+
+
+def parse_exp1_6(data):
+    """Collect W1 across distributions for each (variant, K).
+
+    exp1_6 stores per-cell w1 as {median, min, max} (not {mean, std}); we
+    use the median as the per-cell summary and aggregate across
+    distributions with median+IQR like the other experiments.
+    """
+    r = defaultdict(list)
+    for key, val in data.items():
+        dist, rem = parse_key(key)
+        if dist is None or "w1" not in val:
+            continue
+        # rem is e.g. "biased_K1024"
+        k_pos = rem.rfind("_K")
+        if k_pos < 0:
+            continue
+        variant = rem[:k_pos]
+        K = int(rem[k_pos + 2:])
+        # Prefer median (exp1_6 format), fall back to mean if present.
+        w1 = val["w1"]
+        v = w1.get("median", w1.get("mean"))
+        if v is not None:
+            r[(variant, K)].append(v)
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Exp 1.1 + 1.2: Accumulation with full-batch oracle
 # ---------------------------------------------------------------------------
@@ -141,9 +192,9 @@ def plot_accumulation(exp1_1_data, exp1_2_data, out_dir):
     Ts = sorted(set(k[3] for k in r2))
 
     colors = {
-        "w1_standard": "tab:blue", "w1_pooled": "dodgerblue",
-        "w2_standard": "tab:green", "w2_pooled": "limegreen",
-        "sigreg_standard": "tab:orange", "sigreg_pooled": "gold",
+        "w1_standard": "tab:blue", "w1_pooled": "dodgerblue", "w1_bigbatch": "navy",
+        "w2_standard": "tab:green", "w2_pooled": "limegreen", "w2_bigbatch": "darkgreen",
+        "sigreg_standard": "tab:orange", "sigreg_pooled": "gold", "sigreg_bigbatch": "darkred",
     }
     labels = {"w1": "W1", "w2": "W2", "sigreg": "SIGReg"}
 
@@ -151,13 +202,15 @@ def plot_accumulation(exp1_1_data, exp1_2_data, out_dir):
         fig, ax = plt.subplots(figsize=SUBPLOT_SIZE)
 
         for loss in losses:
-            for mode in ["standard", "pooled"]:
+            for mode in ["standard", "pooled", "bigbatch"]:
                 meds, q25s, q75s = [], [], []
                 for T in Ts:
                     med, q25, q75 = median_iqr(r2.get((loss, mode, M, T), []))
                     meds.append(med); q25s.append(q25); q75s.append(q75)
-                ls = "--" if mode == "standard" else "-"
-                lw = 1.2 if mode == "standard" else 2
+                if all(np.isnan(m) for m in meds):
+                    continue
+                ls = {"standard": "--", "pooled": "-", "bigbatch": ":"}[mode]
+                lw = {"standard": 1.2, "pooled": 2, "bigbatch": 1.5}[mode]
                 ax.errorbar(Ts, meds, yerr=iqr_yerr(meds, q25s, q75s),
                             color=colors[f"{loss}_{mode}"], linestyle=ls,
                             linewidth=lw, capsize=2, label=f"{labels[loss]} {mode}")
@@ -182,32 +235,36 @@ def plot_accumulation(exp1_1_data, exp1_2_data, out_dir):
                     dpi=200, bbox_inches="tight")
         plt.close(fig)
 
-    # Advantage plot
+    # Advantage plot: pooled and bigbatch over standard
     for M in Ms:
         fig, ax = plt.subplots(figsize=SUBPLOT_SIZE)
         for loss in losses:
-            meds, q25s, q75s = [], [], []
-            for T in Ts:
-                sv = r2.get((loss, "standard", M, T), [])
-                pv = r2.get((loss, "pooled", M, T), [])
-                if sv and pv:
-                    pct = [(s - p) / s * 100 for s, p in
-                           zip(sorted(sv), sorted(pv)) if s > 0]
-                    med, q25, q75 = median_iqr(pct)
-                else:
-                    med, q25, q75 = np.nan, np.nan, np.nan
-                meds.append(med); q25s.append(q25); q75s.append(q75)
-            ax.errorbar(Ts, meds, yerr=iqr_yerr(meds, q25s, q75s),
-                        color=colors[f"{loss}_pooled"],
-                        linewidth=2, capsize=2, label=labels[loss])
+            for test_mode, ls in [("pooled", "-"), ("bigbatch", ":")]:
+                meds, q25s, q75s = [], [], []
+                for T in Ts:
+                    sv = r2.get((loss, "standard", M, T), [])
+                    tv = r2.get((loss, test_mode, M, T), [])
+                    if sv and tv:
+                        pct = [(s - t) / s * 100 for s, t in
+                               zip(sorted(sv), sorted(tv)) if s > 0]
+                        med, q25, q75 = median_iqr(pct)
+                    else:
+                        med, q25, q75 = np.nan, np.nan, np.nan
+                    meds.append(med); q25s.append(q25); q75s.append(q75)
+                if all(np.isnan(m) for m in meds):
+                    continue
+                ax.errorbar(Ts, meds, yerr=iqr_yerr(meds, q25s, q75s),
+                            color=colors[f"{loss}_{test_mode}"], linestyle=ls,
+                            linewidth=2, capsize=2,
+                            label=f"{labels[loss]} {test_mode}")
 
         ax.axhline(0, color="black", linestyle=":", alpha=0.3)
         ax.set_xlabel("Accumulation steps $T$")
-        ax.set_ylabel("% improvement (pooled over standard)")
+        ax.set_ylabel("% improvement over standard")
         ax.set_xscale("log", base=2)
         ax.set_xticks(Ts)
         ax.set_xticklabels([str(t) for t in Ts])
-        ax.legend()
+        ax.legend(fontsize=9)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, f"accumulation_advantage_M{M}.png"),
                     dpi=200, bbox_inches="tight")
@@ -453,6 +510,192 @@ def plot_fifo(data, out_dir):
 
 
 # ---------------------------------------------------------------------------
+# Exp 1.6: SIGReg bias variants (full batch, vs K)
+# ---------------------------------------------------------------------------
+
+def plot_sigreg_bias(data, out_dir):
+    if data is None:
+        print("  sigreg bias: no data")
+        return
+
+    r6 = parse_exp1_6(data)
+    if not r6:
+        print("  sigreg bias: no parseable entries")
+        return
+
+    K_values = sorted(set(k[1] for k in r6))
+    variants_present = set(k[0] for k in r6)
+    # Display order: biased, ustat. Sample-split is intentionally excluded
+    # — it has consistently poor results across the sweep, so we drop it
+    # from the aggregate figures to keep the comparison readable.
+    variant_order = [v for v in ["biased", "ustat"] if v in variants_present]
+
+    colors = {"biased": "tab:orange", "ustat": "tab:purple"}
+    labels = {"biased": "biased", "ustat": "U-stat"}
+
+    # Absolute W1 vs K, one curve per variant
+    fig, ax = plt.subplots(figsize=SUBPLOT_SIZE)
+    for variant in variant_order:
+        meds, q25s, q75s = [], [], []
+        for K in K_values:
+            med, q25, q75 = median_iqr(r6.get((variant, K), []))
+            meds.append(med); q25s.append(q25); q75s.append(q75)
+        ax.errorbar(K_values, meds, yerr=iqr_yerr(meds, q25s, q75s),
+                    color=colors.get(variant, "grey"), linewidth=2, capsize=2,
+                    label=labels.get(variant, variant))
+
+    ax.set_xlabel("Full-batch $K$")
+    ax.set_ylabel("W1 to $\\mathcal{N}(0, I)$")
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(K_values)
+    ax.set_xticklabels([str(k) for k in K_values])
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "sigreg_bias.png"),
+                dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Advantage of debiased variants over the biased baseline
+    if "biased" in variants_present:
+        fig, ax = plt.subplots(figsize=SUBPLOT_SIZE)
+        for test_variant in [v for v in ["ustat"] if v in variants_present]:
+            meds, q25s, q75s = [], [], []
+            for K in K_values:
+                bv = r6.get(("biased", K), [])
+                tv = r6.get((test_variant, K), [])
+                if bv and tv:
+                    pct = [(b - t) / b * 100 for b, t in
+                           zip(sorted(bv), sorted(tv)) if b > 0]
+                    med, q25, q75 = median_iqr(pct)
+                else:
+                    med, q25, q75 = np.nan, np.nan, np.nan
+                meds.append(med); q25s.append(q25); q75s.append(q75)
+            ax.errorbar(K_values, meds, yerr=iqr_yerr(meds, q25s, q75s),
+                        color=colors.get(test_variant, "grey"),
+                        linewidth=2, capsize=2,
+                        label=f"{labels.get(test_variant, test_variant)} vs biased")
+
+        ax.axhline(0, color="black", linestyle=":", alpha=0.3)
+        ax.set_xlabel("Full-batch $K$")
+        ax.set_ylabel("% improvement over biased")
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(K_values)
+        ax.set_xticklabels([str(k) for k in K_values])
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "sigreg_bias_advantage.png"),
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  sigreg bias: 2 plots")
+    else:
+        print(f"  sigreg bias: 1 plot (no 'biased' baseline for advantage plot)")
+
+
+# ---------------------------------------------------------------------------
+# Exp 1.8: Dim sweep — final-epoch floor vs D
+# ---------------------------------------------------------------------------
+
+def plot_dim_sweep(data, out_dir):
+    if data is None:
+        print("  dim sweep: no data")
+        return
+    r8 = parse_exp1_8(data)
+    if not r8:
+        print("  dim sweep: no parseable entries")
+        return
+
+    methods = sorted(set(k[0] for k in r8))
+    Ds = sorted(set(k[1] for k in r8))
+
+    method_colors = {
+        "w1":         "tab:blue",
+        "w2":         "tab:green",
+        "sigreg":     "tab:orange",
+        "sigreg+w1":  "tab:red",
+        "sigreg+w2":  "tab:purple",
+    }
+
+    metrics = [
+        ("w1",       "Sliced W1 to $\\mathcal{N}(0, I)$"),
+        ("mean_mse", "$\\|\\mathrm{mean}\\|^2$"),
+        ("cov_frob", "$\\|\\mathrm{cov} - I\\|_F / \\|I\\|_F$"),
+    ]
+
+    fig, axes = plt.subplots(
+        1, len(metrics),
+        figsize=(SUBPLOT_SIZE[0] * len(metrics), SUBPLOT_SIZE[1]))
+    if len(metrics) == 1:
+        axes = [axes]
+    for ax, (mkey, mlabel) in zip(axes, metrics):
+        for m in methods:
+            color = method_colors.get(m, "grey")
+            meds, q25s, q75s = [], [], []
+            for D in Ds:
+                vals = r8.get((m, D), {}).get(mkey, [])
+                med, q25, q75 = median_iqr(vals)
+                meds.append(med); q25s.append(q25); q75s.append(q75)
+            if all(np.isnan(v) for v in meds):
+                continue
+            ax.errorbar(Ds, meds, yerr=iqr_yerr(meds, q25s, q75s),
+                        color=color, linewidth=2, capsize=2, marker="o",
+                        label=m)
+        ax.set_xlabel("Latent dim $D$")
+        ax.set_ylabel(mlabel)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_xticks(Ds)
+        ax.set_xticklabels([str(d) for d in Ds])
+        ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "dim_sweep_floor.png"),
+                dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Per-metric "advantage over W1" panel: relative reduction at each D.
+    if ("w1", Ds[0]) in r8:
+        fig, axes = plt.subplots(
+            1, len(metrics),
+            figsize=(SUBPLOT_SIZE[0] * len(metrics), SUBPLOT_SIZE[1]))
+        if len(metrics) == 1:
+            axes = [axes]
+        for ax, (mkey, mlabel) in zip(axes, metrics):
+            for m in methods:
+                if m == "w1":
+                    continue
+                color = method_colors.get(m, "grey")
+                meds, q25s, q75s = [], [], []
+                for D in Ds:
+                    bv = r8.get(("w1", D), {}).get(mkey, [])
+                    tv = r8.get((m, D), {}).get(mkey, [])
+                    if bv and tv:
+                        pct = [(b - t) / b * 100 for b, t in
+                               zip(sorted(bv), sorted(tv)) if b > 0]
+                        med, q25, q75 = median_iqr(pct)
+                    else:
+                        med, q25, q75 = np.nan, np.nan, np.nan
+                    meds.append(med); q25s.append(q25); q75s.append(q75)
+                if all(np.isnan(v) for v in meds):
+                    continue
+                ax.errorbar(Ds, meds, yerr=iqr_yerr(meds, q25s, q75s),
+                            color=color, linewidth=2, capsize=2, marker="o",
+                            label=m)
+            ax.axhline(0, color="black", linestyle=":", alpha=0.3)
+            ax.set_xlabel("Latent dim $D$")
+            ax.set_ylabel(f"% reduction vs W1\n({mlabel})")
+            ax.set_xscale("log", base=2)
+            ax.set_xticks(Ds)
+            ax.set_xticklabels([str(d) for d in Ds])
+            ax.legend(fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "dim_sweep_advantage.png"),
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  dim sweep: 2 plots")
+    else:
+        print(f"  dim sweep: 1 plot (no w1 baseline for advantage plot)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -469,12 +712,16 @@ def main():
     exp1_3 = load_json(args.results_root, "exp1_3_ddp_sim")
     exp1_4 = load_json(args.results_root, "exp1_4_timing", "timing_results.json")
     exp1_5 = load_json(args.results_root, "exp1_5_fifo")
+    exp1_6 = load_json(args.results_root, "exp1_6_sigreg_bias")
+    exp1_8 = load_json(args.results_root, "exp1_8_dim_sweep", "aggregated.json")
 
     print("Plotting...")
     plot_accumulation(exp1_1, exp1_2, args.out_dir)
     plot_ddp(exp1_3, args.out_dir)
     plot_timing(exp1_4, args.out_dir)
     plot_fifo(exp1_5, args.out_dir)
+    plot_sigreg_bias(exp1_6, args.out_dir)
+    plot_dim_sweep(exp1_8, args.out_dir)
 
     print(f"Done. Saved to {args.out_dir}/")
 

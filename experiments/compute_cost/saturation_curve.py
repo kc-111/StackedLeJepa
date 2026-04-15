@@ -6,14 +6,19 @@ ms/batch and ms/img. The curve shows three regimes:
   - Knee: saturation point where throughput peaks
   - Linear zone (ms scales with batch): compute-bound; cost = constant * batch
 
-Output: markdown table at experiments/compute_cost/results/saturation_<gpu>.md
+Output: CSV at experiments/compute_cost/results/saturation_<gpu>.csv
 
 Usage:
-    python saturation_curve.py --backbone resnet18 --resolution 128
-    python saturation_curve.py --backbone vit_tiny --resolution 128 --multicrop
+    python saturation_curve.py --backbone convnextv2_nano --resolution 128
+    python saturation_curve.py --backbone tiny --resolution 128 --multicrop
+
+Note: BN-based backbones (resnet18/34/50) are NOT pooled-safe — see
+"Note on BatchNorm" in experiments/EXPERIMENT_PLAN.md. Defaults to the
+LayerNorm-only convnextv2_nano.
 """
 
 import argparse
+import csv
 import sys
 import time
 from pathlib import Path
@@ -50,8 +55,10 @@ def time_forward(encoder, x, n=20, warmup=8):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backbone", default="resnet18",
-                        help="encoder_scale: resnet18, resnet34, tiny, ...")
+    parser.add_argument("--backbone", default="convnextv2_nano",
+                        help="encoder_scale: convnextv2_atto/nano, convnext_tiny, "
+                             "tiny (ViT), ... BN backbones (resnet18/34/50) "
+                             "are NOT pooled-safe — see EXPERIMENT_PLAN.md.")
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--data-dir", default=str(REPO_ROOT / "data"))
     parser.add_argument("--out-dir", default=str(Path(__file__).parent / "results"))
@@ -65,7 +72,7 @@ def main():
         data_dir=args.data_dir,
         encoder_scale=args.backbone,
         batch_size=64,
-        global_crop_size=args.resolution,
+        crop_size=args.resolution,
     )
     train_ds, _, _ = get_dataloaders(cfg, device)
     encoder = LeJEPAEncoder(cfg).to(device).eval()
@@ -112,22 +119,16 @@ def main():
         print(line)
         rows.append(dict(n_imgs=n, ms=ms, ms_per_img=per_img, throughput=thru, regime=regime))
 
-    # Write markdown
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"saturation_{gpu_name()}_{args.backbone}_{args.resolution}.md"
-    lines = [
-        f"# Saturation curve — {torch.cuda.get_device_name()}",
-        f"Backbone: `{cfg.backbone_name}`, resolution: {args.resolution}², bf16, eval mode",
-        "",
-        "| n_imgs | time | ms/img | throughput | regime |",
-        "|---:|---:|---:|---:|---|",
-    ]
-    for r in rows:
-        lines.append(
-            f"| {r['n_imgs']} | {r['ms']:.2f} ms | {r['ms_per_img']:.4f} ms "
-            f"| {r['throughput']:.0f}/s | {r['regime']} |")
-    out_path.write_text("\n".join(lines) + "\n")
+    out_path = out_dir / f"saturation_{gpu_name()}_{args.backbone}_{args.resolution}.csv"
+    with out_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["n_imgs", "ms", "ms_per_img", "throughput", "regime"])
+        for r in rows:
+            writer.writerow([
+                r["n_imgs"], r["ms"], r["ms_per_img"], r["throughput"], r["regime"],
+            ])
     print(f"\nSaved {out_path}")
 
 

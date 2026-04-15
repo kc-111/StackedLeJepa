@@ -26,7 +26,7 @@ from matplotlib.ticker import ScalarFormatter
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from src.accumulated_w1 import SlicedW1Loss, SlicedW2Loss, SIGRegLoss
+from src.sliced_gauss_reg import SlicedW1Loss, SlicedW2Loss, SIGRegLoss
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def parse_args():
         description="Exp 1.4: Timing — SIGReg vs W1 vs W2"
     )
     p.add_argument("--batch-sizes", type=int, nargs="+",
-                    default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768])
+                    default=[128, 256, 512, 1024, 2048, 4096])
     p.add_argument("--dimensions", type=int, nargs="+",
                     default=[2, 4, 8, 16, 32, 64, 128, 256])
     p.add_argument("--num-proj", type=int, default=1024)

@@ -24,7 +24,7 @@ if str(REPO_ROOT / "src") not in sys.path:
 from configs import Config
 from data import get_dataloaders, InMemoryGPUDataset, InMemoryEvalLoader
 from models import LeJEPAEncoder, LinearProbe
-from accumulated_w1.evaluate import evaluate_full
+from sliced_gauss_reg.evaluate import evaluate_full
 
 
 @torch.no_grad()

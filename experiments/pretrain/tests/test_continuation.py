@@ -18,8 +18,8 @@ def _make_fake_checkpoint(tmp_path: Path, device, cfg) -> str:
     enc_opt = torch.optim.AdamW(encoder.parameters(), lr=1e-3)
     probe_opt = torch.optim.AdamW(probe.parameters(), lr=1e-3)
     from scheduler import make_scheduler
-    enc_sched = make_scheduler(enc_opt, 1, 100, 1e-3, 1e-5)
-    probe_sched = make_scheduler(probe_opt, 1, 100, 1e-3, 1e-5)
+    enc_sched = make_scheduler(enc_opt, 1, 1e-3)
+    probe_sched = make_scheduler(probe_opt, 1, 1e-3)
 
     ckpt_path = tmp_path / "fake_base.pt"
     save_checkpoint(str(ckpt_path), encoder, probe, enc_opt, probe_opt,
