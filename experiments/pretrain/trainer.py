@@ -65,15 +65,35 @@ def build_run_dir(cfg):
     return Path(cfg.save_dir) / base
 
 
-def load_for_continuation(checkpoint_path: str, encoder, probe, device):
+def load_for_continuation(checkpoint_path: str, encoder, probe, device,
+                          load_probe: bool = True):
     """Load encoder and probe state from a base checkpoint.
 
     Optimizer / scheduler / RNG / epoch counters are NOT loaded — continuation
     starts a fresh training phase with its own LR schedule.
+
+    If ``load_probe`` is False, the probe is left at its freshly-initialized
+    state. If True, the probe is loaded only when its state dict shapes are
+    compatible (e.g., probe_on_emb unchanged); otherwise a warning is printed
+    and the probe is reinitialized from scratch.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     encoder.load_state_dict(ckpt["encoder"])
-    probe.load_state_dict(ckpt["probe"])
+
+    if load_probe:
+        ckpt_probe = ckpt["probe"]
+        cur_probe = probe.state_dict()
+        shape_ok = (set(ckpt_probe.keys()) == set(cur_probe.keys())
+                    and all(ckpt_probe[k].shape == cur_probe[k].shape
+                            for k in cur_probe))
+        if shape_ok:
+            probe.load_state_dict(ckpt_probe)
+        else:
+            ckpt_cfg = ckpt.get("config", {})
+            ckpt_on_emb = ckpt_cfg.get("probe_on_emb", "?")
+            print(f"  [continuation] probe shape mismatch "
+                  f"(ckpt probe_on_emb={ckpt_on_emb}) — "
+                  f"reinitializing probe from scratch")
     return ckpt
 
 

@@ -2,9 +2,9 @@
 
 import torch
 import torch.nn as nn
-import timm
 
 from configs import is_vit
+from StackedLeJepa.backbone import create_backbone
 
 
 class Projector(nn.Module):
@@ -47,20 +47,13 @@ class LeJEPAEncoder(nn.Module):
         self.backbone_name = cfg.backbone_name
         self._is_vit = is_vit(cfg.backbone_name)
 
-        # timm kwargs
-        kwargs = dict(pretrained=False, num_classes=0)
-        if self._is_vit:
-            # Allow forwarding at multiple resolutions for multi-crop
-            # (global=224, local=96 typically). dynamic_img_size lets a single
-            # ViT handle both without re-instantiating positional embeddings.
-            kwargs["dynamic_img_size"] = True
-            kwargs["img_size"] = cfg.crop_size
-            kwargs["patch_size"] = cfg.patch_size
-
-        self.backbone = timm.create_model(cfg.backbone_name, **kwargs)
-        if getattr(cfg, "grad_checkpoint", False) and hasattr(
-                self.backbone, "set_grad_checkpointing"):
-            self.backbone.set_grad_checkpointing(True)
+        self.backbone = create_backbone(
+            model_name=cfg.backbone_name,
+            crop_size=cfg.crop_size,
+            patch_size=cfg.patch_size if self._is_vit else None,
+            pretrained=False,
+            grad_checkpoint=getattr(cfg, "grad_checkpoint", False),
+        )
         self._hidden_dim = self.backbone.num_features
         self.projector = Projector(self._hidden_dim, cfg.proj_hidden, cfg.proj_dim)
 
