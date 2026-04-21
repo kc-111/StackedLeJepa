@@ -33,7 +33,8 @@ import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for p in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+SYNTHETIC_DIR = REPO_ROOT / "experiments" / "synthetic"
+for p in (str(REPO_ROOT), str(SYNTHETIC_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 

@@ -39,10 +39,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, REPO_ROOT)
+SYNTHETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SYNTHETIC_DIR)
 
-from src.sliced_gauss_reg import (
+from sliced_gauss_reg import (
     SlicedW1Loss, SlicedW2Loss, SIGRegLoss, SIGReg, PooledSlicedLoss,
     DeepMLP, generate_data, make_fixed_projection, epoch_iter, GENERATORS,
     eval_w1, evaluate_full,

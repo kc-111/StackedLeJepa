@@ -1,2 +1,0 @@
-1. Sliced-Wasserstein Autoencoder: An Embarrassingly Simple Generative Model
-2. Rectified LpJEPA: Joint-Embedding Predictive Architectures with Sparse and Maximum-Entropy Representations

@@ -15,10 +15,10 @@ import argparse
 
 import torch
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, REPO_ROOT)
+SYNTHETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SYNTHETIC_DIR)
 
-from src.sliced_gauss_reg import DeepMLP, generate_data, make_fixed_projection
+from sliced_gauss_reg import DeepMLP, generate_data, make_fixed_projection
 
 
 def test_synthetic(device):

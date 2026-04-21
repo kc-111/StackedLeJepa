@@ -11,7 +11,7 @@ this becomes a (1 − |φ_θ|²) offset per frequency. This offset depends on
 the model state through φ_θ, so its gradient is not zero — debiasing may
 or may not move the optimization in practice.
 
-Variants (see ``src/sliced_gauss_reg/sigreg.py``):
+Variants (see ``experiments/synthetic/sliced_gauss_reg/sigreg.py``):
     biased — current SIGReg: |φ̂(t) − φ_N(t)|²
     ustat  — U-statistic: |φ_θ|² ≈ (n/(n-1))|φ̂|² − 1/(n-1)
     split  — sample split: |φ_θ|² ≈ Re(φ̂_A · φ̂_B*) on disjoint halves
@@ -40,10 +40,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, REPO_ROOT)
+SYNTHETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SYNTHETIC_DIR)
 
-from src.sliced_gauss_reg import (
+from sliced_gauss_reg import (
     SIGRegLoss,
     DeepMLP, generate_data, make_fixed_projection, GENERATORS,
     eval_w1, evaluate_full,
