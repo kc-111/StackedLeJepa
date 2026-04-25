@@ -9,6 +9,8 @@ Batch size matters for the distributional regularization and sliced wassertain d
 2. Although not state of the art, preliminary investigation (in train directory) show that batch size does not matter much for SSL for the imagenette dataset using LeJEPA. Evaluation is done with both KNN and linear probe and show minimal difference when trained until 800 epochs. The LeJEPA paper trained until 100 epochs, maybe the difference closes after 100. However, this finding is confounded by the fact that probing and such is evaluated based on the embeddings and not the projected embeddings where the invariance loss and regularizer applies. The LeJEPA paper theory suggests that isotropic gaussian is the optimal distribution for downstream purposes, but probing results show that if projected output is used, there may be 1-2% decrease in performance for CIFAR10, CIFAR100, and imagenette, which is not that bad compared to prior work where they observed a 10% decrease. However, guillotine regularization is still needed for higher performance.
 3. Performance of LeJEPA, like other SSL methods, are heavily dependent on augmentation methods.
 4. MoCo style of storing embeddings will not work for LeJEPA unlike for contrastive based methods.
+5. Cosine is not as good as MSE in convergence and is slower. Cosine as objective misses out on magnitude information, adding that back in does not lead to better performance than MSE and may need more tuning.
+6. Setting a margin doesn't seem to significantly improve things, so it may not be important.
 
 **Conclusion**:
 

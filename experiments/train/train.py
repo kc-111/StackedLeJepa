@@ -80,6 +80,35 @@ def _build_imagefolder(subdir: str, num_classes: int):
     return loaders, num_classes
 
 
+class _HFTupleAdapter(torch.utils.data.Dataset):
+    """Adapt a HuggingFace dataset (dict-yielding) to the (image, label)
+    tuple shape that ``spt.data.FromTorchDataset`` expects."""
+    def __init__(self, hf_ds):
+        self.ds = hf_ds
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        row = self.ds[int(idx)]
+        return row["image"], row["label"]
+
+
+def _build_imagenet100_parquet(num_classes: int = 100):
+    """imagenet-100 ships as HF parquet shards under
+    {DATA_DIR}/imagenet-100/data/{train,validation}-*.parquet
+    with `image` (auto-decoded to PIL) and `label` (int) columns."""
+    def loaders():
+        import datasets as hf_datasets
+        root = DATA_DIR / "imagenet-100" / "data"
+        ds = hf_datasets.load_dataset("parquet", data_files={
+            "train": sorted(str(p) for p in root.glob("train-*.parquet")),
+            "validation": sorted(str(p) for p in root.glob("validation-*.parquet")),
+        })
+        return _HFTupleAdapter(ds["train"]), _HFTupleAdapter(ds["validation"])
+    return loaders, num_classes
+
+
 # (loaders_fn, num_classes, default_image_size, normalization_constants)
 _DATASETS = {
     "cifar10": (*_build_cifar(10, torchvision.datasets.CIFAR10),
@@ -88,7 +117,7 @@ _DATASETS = {
                  32, spt.data.static.CIFAR100),
     "imagenette": (*_build_imagefolder("imagenette2-160", 10),
                    128, spt.data.static.ImageNet),
-    "imagenet-100": (*_build_imagefolder("imagenet-100", 100),
+    "imagenet-100": (*_build_imagenet100_parquet(100),
                      224, spt.data.static.ImageNet),
 }
 
@@ -234,6 +263,7 @@ def make_lejepa_forward(live_batch_size: int, live_views: int):
                 live_emb = [self.backbone(v["image"][:B]) for v in views[:V]]
                 live_z = [self.projector(e) for e in live_emb]   # V × (B, D)
                 live_emb_cat = torch.cat(live_emb, dim=0)         # for probes
+                live_z_cat = torch.cat(live_z, dim=0)             # for probes
 
                 # --- NG extra forwards: V*M calls, each on B images ---
                 # Each live view v has its no-grad rows sliced into M chunks
@@ -290,7 +320,6 @@ def make_lejepa_forward(live_batch_size: int, live_views: int):
                     reg = self.regularizer(pooled)
                     if self.regularizer.needs_compensation:
                         reg = reg * (pooled.shape[0] / B)
-                    pool_size_log = float(pooled.shape[0])
                 else:
                     # Mode (a): per-view regularizer, averaged over V views.
                     # Stack live + ng_fwd per view → (V, dl_bs, D) and call the
@@ -319,7 +348,6 @@ def make_lejepa_forward(live_batch_size: int, live_views: int):
                     if self.regularizer.needs_compensation:
                         reg = reg * (pool_rows / B)
                     live_pick = None
-                    pool_size_log = float(V * cols.shape[1])
 
                 # --- Invariance: mean-target variance across views ---
                 # For each image, compute z̄ = mean over views (live + extras);
@@ -330,26 +358,57 @@ def make_lejepa_forward(live_batch_size: int, live_views: int):
                 # No-grad extras pull the centroid without receiving gradient.
                 all_inv_views = live_z + ng_extra_z  # V*(1+K) tensors, each (B, D)
                 if len(all_inv_views) >= 2:
-                    stacked = torch.stack(all_inv_views, dim=0)   # (V*(1+K), B, D)
+                    stacked = torch.stack(all_inv_views, dim=0)   # (V_total, B, D)
+                    V_total = stacked.shape[0]
+                    D = stacked.shape[-1]
                     mean_z = stacked.mean(dim=0, keepdim=True)    # (1, B, D)
-                    inv = (stacked - mean_z).square().mean()
+
+                    # Shared primitives. Magnitude alignment is computed and
+                    # logged regardless of objective (cheap, useful diagnostic):
+                    # cosine ignores scale, but even MSE benefits from seeing
+                    # whether residual variance is direction- or norm-driven.
+                    norms = stacked.norm(dim=-1)                       # (V_total, B)
+                    mean_norm = norms.mean(dim=0, keepdim=True).clamp_min(1e-8)
+                    mag_loss = ((norms - mean_norm) / mean_norm).square().mean()
+                    self.log(f"{stage}/mag_loss", mag_loss,
+                             on_step=False, on_epoch=True, sync_dist=True)
+
+                    if self.inv_loss == "cosine":
+                        # Direction term. Reuse `norms` in the cosine denominator
+                        # rather than recomputing via F.cosine_similarity.
+                        # inv_tol=0.1 ⇒ stop pressure once cos ≥ 0.9. Total inv
+                        # adds mag_loss so views align in both direction and scale.
+                        z_bar_norm = mean_z.norm(dim=-1).clamp_min(1e-8)  # (1, B)
+                        inner = (stacked * mean_z).sum(dim=-1)            # (V_total, B)
+                        cos = inner / (norms.clamp_min(1e-8) * z_bar_norm)
+                        cos_loss = torch.clamp(
+                            (1.0 - cos) - self.inv_tol, min=0.0).mean()
+                        self.log(f"{stage}/cos_loss", cos_loss,
+                                 on_step=False, on_epoch=True, sync_dist=True)
+                        inv = cos_loss + mag_loss
+                    else:  # "mse"
+                        per_sample_sq = (stacked - mean_z).square().sum(dim=-1)  # (V_total, B)
+                        # Under N(0, I) and conditional on z̄, E‖z_v − z̄‖² = D·(V−1)/V.
+                        # The margin zeros the penalty below inv_tol fraction of that
+                        # floor — anything tighter would fight the regularizer.
+                        prior_floor = D * (V_total - 1) / V_total
+                        margin = self.inv_tol * prior_floor
+                        inv = torch.clamp(per_sample_sq - margin, min=0.0).mean() / D
                 else:
                     inv = torch.zeros((), device=dev, dtype=live_z[0].dtype)
 
                 loss = self.lambd * reg + (1.0 - self.lambd) * inv
                 out["loss"] = loss
 
-                # Expose embeddings for online probes (live rows only)
+                # Expose embeddings/projections for online probes (live rows only)
                 out["embedding"] = live_emb_cat
+                out["projection"] = live_z_cat
                 if "label" in views[0]:
                     out["label"] = torch.cat(
                         [v["label"][:B] for v in views[:V]], dim=0)
 
-                self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, sync_dist=True)
-                self.log(f"{stage}/inv_loss", inv, on_step=True, on_epoch=True, sync_dist=True)
-                self.log(f"{stage}/reg_loss", reg, on_step=True, on_epoch=True, sync_dist=True)
-                self.log(f"{stage}/pool_size", pool_size_log,
-                         on_step=True, on_epoch=True, sync_dist=True)
+                self.log(f"{stage}/inv_loss", inv, on_step=False, on_epoch=True, sync_dist=True)
+                self.log(f"{stage}/reg_loss", reg, on_step=False, on_epoch=True, sync_dist=True)
 
                 # FIFO update: only defined in flat-sampled mode (FIFO on).
                 if self.fifo_size > 0 and live_pick is not None:
@@ -362,11 +421,15 @@ def make_lejepa_forward(live_batch_size: int, live_views: int):
                 # Eval: one forward per live view (probe expects matched labels)
                 V = live_views
                 emb = [self.backbone(v["image"]) for v in views[:V]]
+                proj = [self.projector(e) for e in emb]
                 out["embedding"] = torch.cat(emb, dim=0)
+                out["projection"] = torch.cat(proj, dim=0)
                 if "label" in views[0]:
                     out["label"] = torch.cat([v["label"] for v in views[:V]], dim=0)
         else:
-            out["embedding"] = self.backbone(batch["image"])
+            emb = self.backbone(batch["image"])
+            out["embedding"] = emb
+            out["projection"] = self.projector(emb)
             if "label" in batch:
                 out["label"] = batch["label"]
 
@@ -436,7 +499,7 @@ def allocate_run(log_dir: Path, dataset: str, backbone: str,
 
 def build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="imagenette",
+    p.add_argument("--dataset", default="imagenet-100",
                    choices=["cifar10", "cifar100" "imagenette", "imagenet-100"])
     p.add_argument("--image-size", type=int, default=None,
                    help="Override dataset default image size")
@@ -444,8 +507,21 @@ def build_parser():
     p.add_argument("--regularizer", default="sigreg",
                    choices=["sigreg", "sigreg_raw", "w1", "w2"])
     p.add_argument("--lambd", type=float, default=0.05)
-    p.add_argument("--proj-dim", type=int, default=512)
-    p.add_argument("--proj-hidden", type=int, default=64)
+    p.add_argument("--inv-loss", default="mse", choices=["mse", "cosine"],
+                   help="Invariance form. 'mse': ‖z_v − z̄‖² (unnormalized, "
+                        "scale-aware). 'cosine': 1 − cos(z_v, z̄) "
+                        "(normalized, scale-invariant).")
+    p.add_argument("--inv-tol", type=float, default=0.0,
+                   help="Invariance margin. For --inv-loss mse: fraction of "
+                        "the N(0, I) prior floor ‖z_v − z̄‖² = D·(V−1)/V "
+                        "below which invariance has no penalty. For "
+                        "--inv-loss cosine: direct margin on (1 − cos), so "
+                        "0.1 means stop pressure once cos ≥ 0.9 (under "
+                        "N(0, I) prior E[cos] ≈ 1/√V_total, so inv_tol "
+                        "≈ 1 − 1/√V_total matches the noise floor). "
+                        "0 = strict invariance; higher = more slack.")
+    p.add_argument("--proj-dim", type=int, default=64)
+    p.add_argument("--proj-hidden", type=int, default=2048)
     p.add_argument("--num-proj", type=int, default=2048)
     p.add_argument("--knots", type=int, default=17)
     p.add_argument("--live-views", type=int, default=2,
@@ -467,12 +543,12 @@ def build_parser():
                         "first batch_size are live, remaining M*batch_size "
                         "are forwarded as M separate no-grad calls of "
                         "batch_size each (BN-consistent).")
-    p.add_argument("--batch-size", type=int, default=16,
+    p.add_argument("--batch-size", type=int, default=256,
                    help="Live (grad-carrying) samples per step")
-    p.add_argument("--epochs", type=int, default=800)
-    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--epochs", type=int, default=400)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=5e-4)
-    p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=16)
     p.add_argument("--flatten-reg", action="store_true",
                    help="Flatten (V, B, D) → (V*B, D) before calling the "
                         "regularizer (FIFO-off path only). Matches the "
@@ -523,6 +599,8 @@ def main():
             live_batch_size=args.batch_size, live_views=args.live_views),
         regularizer=regularizer,
         lambd=args.lambd,
+        inv_loss=args.inv_loss,
+        inv_tol=args.inv_tol,
         flatten_reg=args.flatten_reg,
         # Internal fifo_size (sample cap) = factor × batch_size, so FIFO
         # stabilizes at exactly fifo_factor batches of past projections.
@@ -539,26 +617,47 @@ def main():
         },
     )
 
-    linear_probe = spt.callbacks.OnlineProbe(
+    def _cls_metrics():
+        return {
+            "top1": torchmetrics.classification.MulticlassAccuracy(num_classes),
+            "top5": torchmetrics.classification.MulticlassAccuracy(
+                num_classes, top_k=5),
+        }
+
+    linear_probe_emb = spt.callbacks.OnlineProbe(
         module,
-        name="linear_probe",
+        name="linear_probe_emb",
         input="embedding",
         target="label",
         probe=nn.Linear(emb_dim, num_classes),
         loss=nn.CrossEntropyLoss(),
-        metrics={
-            "top1": torchmetrics.classification.MulticlassAccuracy(num_classes),
-            "top5": torchmetrics.classification.MulticlassAccuracy(
-                num_classes, top_k=5),
-        },
+        metrics=_cls_metrics(),
     )
-    knn_probe = spt.callbacks.OnlineKNN(
-        name="knn_probe",
+    linear_probe_proj = spt.callbacks.OnlineProbe(
+        module,
+        name="linear_probe_proj",
+        input="projection",
+        target="label",
+        probe=nn.Linear(args.proj_dim, num_classes),
+        loss=nn.CrossEntropyLoss(),
+        metrics=_cls_metrics(),
+    )
+    knn_probe_emb = spt.callbacks.OnlineKNN(
+        name="knn_probe_emb",
         input="embedding",
         target="label",
         queue_length=20000,
         metrics={"accuracy": torchmetrics.classification.MulticlassAccuracy(num_classes)},
         input_dim=emb_dim,
+        k=20,
+    )
+    knn_probe_proj = spt.callbacks.OnlineKNN(
+        name="knn_probe_proj",
+        input="projection",
+        target="label",
+        queue_length=20000,
+        metrics={"accuracy": torchmetrics.classification.MulticlassAccuracy(num_classes)},
+        input_dim=args.proj_dim,
         k=20,
     )
 
@@ -573,18 +672,64 @@ def main():
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         num_sanity_val_steps=0,
-        callbacks=[knn_probe, linear_probe, ckpt_cb],
+        callbacks=[
+            linear_probe_emb, linear_probe_proj,
+            knn_probe_emb, knn_probe_proj,
+            ckpt_cb,
+        ],
         precision="16-mixed",
         logger=logger,
     )
     # Lightning auto-injects stable_pretraining's default callbacks (via the
-    # "lightning.pytorch.callbacks_factory" entry point). Drop only the env
-    # dump — it writes environment.json and requirements_frozen.txt to the
-    # repo root on every fit. Keep LoggingCallback etc. so we still see the
-    # per-epoch metrics table.
-    from stable_pretraining.callbacks import EnvironmentDumpCallback
+    # "lightning.pytorch.callbacks_factory" entry point). Drop the env dump
+    # (writes environment.json/requirements_frozen.txt to repo root every
+    # fit) and swap the default LoggingCallback for one that prints only
+    # `eval/` metrics — training step/epoch metrics stay in the CSV but
+    # don't clutter the end-of-val table.
+    from stable_pretraining.callbacks import (
+        EnvironmentDumpCallback,
+        LoggingCallback,
+    )
+    from lightning.pytorch.utilities import rank_zero_only
+    from prettytable import PrettyTable
+    import logging as _logging
+
+    class EvalOnlyLoggingCallback(LoggingCallback):
+        # Print after on_train_epoch_end: at that point val has finished
+        # (its metrics are already merged into _callback_metrics) AND the
+        # train-epoch aggregates are accessible via the callback_metrics
+        # property (which auto-pulls from _results). on_validation_end
+        # fires too early — Lightning runs val inside the training epoch
+        # loop, before train-epoch aggregates are finalized.
+        #
+        # Keeps: eval/* (probe val metrics, with duplicate *_epoch keys
+        # stripped) + fit/{inv,reg}_loss epoch aggregates.
+        # Drops: train/* (per-batch probe train metrics).
+        @rank_zero_only
+        def on_validation_end(self, trainer, pl_module):
+            pass  # printing happens in on_train_epoch_end below
+
+        @rank_zero_only
+        def on_train_epoch_end(self, trainer, pl_module):
+            metrics = trainer.callback_metrics
+            table = PrettyTable()
+            table.field_names = ["Metric", "Value"]
+            for key in sorted(metrics):
+                if not (key.startswith("eval/") or key.startswith("fit/")):
+                    continue
+                # Probe logs both `eval/x` and `eval/x_epoch` with the same
+                # value — drop the _epoch dupes.
+                if key.endswith("_epoch") and key[:-len("_epoch")] in metrics:
+                    continue
+                table.add_row([
+                    "\033[0;34;40m" + key + "\033[0m",
+                    "\033[0;32;40m" + str(metrics[key].item()) + "\033[0m",
+                ])
+            _logging.info(f"\n{table}")
+
     trainer.callbacks = [
-        cb for cb in trainer.callbacks
+        EvalOnlyLoggingCallback() if isinstance(cb, LoggingCallback) else cb
+        for cb in trainer.callbacks
         if not isinstance(cb, EnvironmentDumpCallback)
     ]
 
