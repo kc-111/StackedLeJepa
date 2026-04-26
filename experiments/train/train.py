@@ -499,7 +499,7 @@ def allocate_run(log_dir: Path, dataset: str, backbone: str,
 
 def build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="imagenet-100",
+    p.add_argument("--dataset", default="imagenette",
                    choices=["cifar10", "cifar100" "imagenette", "imagenet-100"])
     p.add_argument("--image-size", type=int, default=None,
                    help="Override dataset default image size")
