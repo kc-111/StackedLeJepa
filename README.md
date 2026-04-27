@@ -11,6 +11,8 @@ Batch size matters for the distributional regularization and sliced wassertain d
 4. MoCo style of storing embeddings will not work for LeJEPA unlike for contrastive based methods.
 5. Cosine is not as good as MSE in convergence and is slower. Cosine as objective misses out on magnitude information, adding that back in does not lead to better performance than MSE and may need more tuning.
 6. Setting a margin doesn't seem to significantly improve things, so it may not be important.
+7. Using MAE instead of MSE for invariance loss leads to worse outcomes.
+8. Like in research, there is a need for patch cooccurence (each view has their own crop). Simply blurring random regions + flipping don't work on small datasets.
 
 **Conclusion**:
 
