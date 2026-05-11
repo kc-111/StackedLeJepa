@@ -1,0 +1,25 @@
+{
+  "backbone": "resnet18",
+  "batch_size": 128,
+  "dataset": "cifar100",
+  "epochs": 800,
+  "image_size": null,
+  "inv_loss": "mse",
+  "inv_tol": 0.0,
+  "knots": 17,
+  "lambd": 0.8,
+  "lr": 0.0005,
+  "num_proj": 2048,
+  "num_views": 2,
+  "num_workers": 16,
+  "proj_dims": [
+    16,
+    32,
+    128
+  ],
+  "proj_hidden": 512,
+  "regularizer": "w1",
+  "run_name": "cifar100_resnet18_3",
+  "seed": 0,
+  "weight_decay": 0.0005
+}
